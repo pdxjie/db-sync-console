@@ -10,6 +10,7 @@ let backendProcess = null;
 let backendUrl = null;
 
 const isMac = process.platform === "darwin";
+const APP_NAME = "Data Sync Studio";
 function appRootPath() {
   if (app.isPackaged) {
     return path.join(process.resourcesPath, "app");
@@ -183,28 +184,34 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 940,
-    minWidth: 980,
-    minHeight: 700,
-    title: "DB Sync Console",
+    minWidth: 1180,
+    minHeight: 760,
+    title: APP_NAME,
     backgroundColor: "#f4f6f8",
     titleBarStyle: isMac ? "hiddenInset" : "default",
     trafficLightPosition: { x: 16, y: 18 },
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
+      additionalArguments: [`--db-sync-api=${backendUrl}`],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
 
-  mainWindow.loadURL(backendUrl);
+  const rendererIndex = path.join(appRootPath(), "desktop", "renderer", "dist", "index.html");
+  if (fs.existsSync(rendererIndex)) {
+    mainWindow.loadFile(rendererIndex);
+  } else {
+    mainWindow.loadURL(backendUrl);
+  }
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
 }
 
 async function boot() {
-  app.setName("DB Sync Console");
+  app.setName(APP_NAME);
   createMenu();
   const port = await findFreePort();
   backendUrl = `http://127.0.0.1:${port}`;
@@ -214,7 +221,7 @@ async function boot() {
     createWindow();
   } catch (error) {
     dialog.showErrorBox(
-      "DB Sync Console failed to start",
+      `${APP_NAME} failed to start`,
       `Unable to start the local sync backend.\n\n${error.message}`
     );
     app.quit();

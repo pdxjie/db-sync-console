@@ -1,18 +1,19 @@
 {
-  "name": "db-sync-console",
+  "name": "data-sync-studio",
   "version": "0.1.0",
-  "description": "Desktop shell for DB Sync Console.",
+  "description": "Desktop database sync studio.",
   "main": "desktop/main.cjs",
   "private": true,
   "scripts": {
-    "desktop": "electron .",
-    "desktop:dev": "electron .",
-    "desktop:pack": "electron-builder --mac dir",
-    "desktop:dist": "electron-builder --mac dmg"
+    "renderer:build": "vite --config desktop/renderer/vite.config.js build",
+    "desktop": "npm run renderer:build && electron .",
+    "desktop:dev": "npm run renderer:build && electron .",
+    "desktop:pack": "npm run renderer:build && electron-builder --mac dir",
+    "desktop:dist": "npm run renderer:build && electron-builder --mac dmg"
   },
   "build": {
-    "appId": "com.pdxjie.dbsyncconsole",
-    "productName": "DB Sync Console",
+    "appId": "com.pdxjie.datasyncstudio",
+    "productName": "Data Sync Studio",
     "asar": false,
     "directories": {
       "output": "release"
@@ -33,8 +34,16 @@
       ]
     }
   },
+  "dependencies": {
+    "@ant-design/icons": "5.3.7",
+    "antd": "5.16.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
   "devDependencies": {
+    "@vitejs/plugin-react": "4.2.1",
     "electron": "22.3.27",
-    "electron-builder": "24.13.3"
+    "electron-builder": "24.13.3",
+    "vite": "4.5.3"
   }
 }

@@ -1,6 +1,6 @@
-# DB Sync Console
+# Data Sync Studio
 
-本地数据库同步控制台，用来把产品环境数据库的指定表同步到测试环境。当前 provider 支持 MySQL，后续可以继续扩展 PostgreSQL、SQL Server 等数据库。第一版聚焦 `prod -> test`，支持表搜索勾选、`replace` / `upsert`、`where` 条件、同步计划、`dry-run`、分页、断点继续、日志、常用任务和 crontab 定时任务。
+本地数据库同步工作台，用来把产品环境数据库的指定表同步到测试环境。当前 provider 支持 MySQL，后续可以继续扩展 PostgreSQL、SQL Server 等数据库。第一版聚焦 `prod -> test`，支持表搜索勾选、`replace` / `upsert`、`where` 条件、同步计划、`dry-run`、分页、断点继续、日志、常用任务和 crontab 定时任务。
 
 ## 快速开始
 
@@ -29,7 +29,7 @@ data/sync_console.db
 
 ## Mac 桌面应用
 
-桌面版使用 Electron 作为 macOS 窗口壳，启动时会自动拉起本地 FastAPI 后端，并打开 DB Sync Console。后端使用随机本地端口，不会和 `8765` 的浏览器版抢端口。
+桌面版使用 Electron 启动 macOS 应用窗口，并自动拉起本地 FastAPI 后端作为同步引擎。桌面端使用独立 React/Ant Design renderer，不再直接嵌入浏览器版页面；后端使用随机本地端口，不会和 `8765` 的浏览器版抢端口。
 
 安装桌面依赖：
 
@@ -58,7 +58,7 @@ npm run desktop:pack
 生成路径：
 
 ```text
-release/mac/DB Sync Console.app
+release/mac/Data Sync Studio.app
 ```
 
 打包 dmg：

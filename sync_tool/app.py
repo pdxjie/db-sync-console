@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -83,7 +84,14 @@ engine = SyncEngine(lambda: effective_config(), store)
 manager = SyncManager(engine)
 scheduler = JobScheduler(base_config, store, manager)
 
-app = FastAPI(title="DB Sync Console", version="0.1.0")
+app = FastAPI(title="Data Sync Studio", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 
 
