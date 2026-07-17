@@ -154,6 +154,21 @@ function createMenu() {
       ],
     },
     {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        ...(isMac ? [{ role: "pasteAndMatchStyle" }] : []),
+        { role: "delete" },
+        { type: "separator" },
+        { role: "selectAll" },
+      ],
+    },
+    {
       label: "View",
       submenu: [
         { role: "reload" },
@@ -205,6 +220,27 @@ function createWindow() {
   } else {
     mainWindow.loadURL(backendUrl);
   }
+  mainWindow.webContents.on("context-menu", (event, params) => {
+    const template = [];
+    if (params.isEditable) {
+      template.push(
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut", enabled: params.editFlags.canCut },
+        { role: "copy", enabled: params.editFlags.canCopy },
+        { role: "paste", enabled: params.editFlags.canPaste },
+        { role: "delete", enabled: params.editFlags.canDelete },
+        { type: "separator" },
+        { role: "selectAll", enabled: params.editFlags.canSelectAll }
+      );
+    } else if (params.selectionText) {
+      template.push({ role: "copy" });
+    }
+    if (template.length > 0) {
+      Menu.buildFromTemplate(template).popup({ window: mainWindow });
+    }
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
