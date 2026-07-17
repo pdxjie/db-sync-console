@@ -1,0 +1,35 @@
+{
+  "prod": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "readonly_user",
+    "password": "",
+    "database": "prod_db",
+    "charset": "utf8mb4",
+    "connect_timeout": 10,
+    "read_timeout": 120,
+    "write_timeout": 120
+  },
+  "test": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "test_user",
+    "password": "",
+    "database": "test_db",
+    "charset": "utf8mb4",
+    "connect_timeout": 10,
+    "read_timeout": 120,
+    "write_timeout": 120
+  },
+  "app": {
+    "page_size": 1000,
+    "data_dir": "./data",
+    "log_dir": "./logs",
+    "timezone": "Asia/Shanghai",
+    "strict_schema": true
+  },
+  "safety": {
+    "blocked_tables": [],
+    "max_rows_without_where": 1000000
+  }
+}

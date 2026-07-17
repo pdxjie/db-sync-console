@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DB Sync Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-block">
+        <h1>DB Sync Console</h1>
+        <p id="connectionSummary">正在读取配置...</p>
+      </div>
+      <div class="top-actions">
+        <span id="connectionState" class="status-pill">未登录</span>
+        <button id="refreshAllBtn" class="secondary">刷新</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel connection-panel">
+        <div class="panel-head">
+          <div>
+            <h2>连接登录</h2>
+            <span class="muted">产品库只读，测试库写入</span>
+          </div>
+          <div class="action-row">
+            <button id="saveConnectionsBtn" class="secondary">保存连接</button>
+            <button id="loginConnectionsBtn" class="primary">测试并登录</button>
+          </div>
+        </div>
+        <div class="connection-grid">
+          <fieldset>
+            <legend>产品库</legend>
+            <div class="connection-fields">
+              <label>
+                <span>host</span>
+                <input id="prodHost" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>port</span>
+                <input id="prodPort" class="control" type="number" min="1" value="3306" />
+              </label>
+              <label>
+                <span>user</span>
+                <input id="prodUser" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>password</span>
+                <input id="prodPassword" class="control" type="password" autocomplete="new-password" placeholder="留空沿用已保存密码" />
+              </label>
+              <label>
+                <span>database</span>
+                <input id="prodDatabase" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>charset</span>
+                <input id="prodCharset" class="control" value="utf8mb4" />
+              </label>
+              <button id="testProdBtn" class="secondary field-button">测试</button>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>测试库</legend>
+            <div class="connection-fields">
+              <label>
+                <span>host</span>
+                <input id="testHost" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>port</span>
+                <input id="testPort" class="control" type="number" min="1" value="3306" />
+              </label>
+              <label>
+                <span>user</span>
+                <input id="testUser" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>password</span>
+                <input id="testPassword" class="control" type="password" autocomplete="new-password" placeholder="留空沿用已保存密码" />
+              </label>
+              <label>
+                <span>database</span>
+                <input id="testDatabase" class="control" autocomplete="off" />
+              </label>
+              <label>
+                <span>charset</span>
+                <input id="testCharset" class="control" value="utf8mb4" />
+              </label>
+              <button id="testTestBtn" class="secondary field-button">测试</button>
+            </div>
+          </fieldset>
+        </div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-head">
+          <div>
+            <h2>线上表</h2>
+            <span id="selectedCount" class="muted">已选 0</span>
+          </div>
+          <button id="reloadTablesBtn" class="secondary">重载</button>
+        </div>
+        <input id="tableSearch" class="control" type="search" placeholder="搜索表名" />
+        <div class="table-actions">
+          <button id="selectVisibleBtn" class="secondary">选择当前</button>
+          <button id="clearSelectionBtn" class="secondary">清空</button>
+        </div>
+        <div id="tableList" class="table-list"></div>
+        <div id="tableError" class="error-text"></div>
+      </section>
+
+      <section class="main-stack">
+        <section class="panel settings-panel">
+          <div class="panel-head">
+            <div>
+              <h2>同步设置</h2>
+              <span class="muted">prod -> test</span>
+            </div>
+            <div class="action-row">
+              <button id="planBtn" class="secondary">生成计划</button>
+              <button id="startBtn" class="primary">开始同步</button>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <label>
+              <span>模式</span>
+              <select id="mode" class="control">
+                <option value="replace">replace</option>
+                <option value="upsert">upsert</option>
+              </select>
+            </label>
+            <label>
+              <span>分页大小</span>
+              <input id="batchSize" class="control" type="number" min="1" value="1000" />
+            </label>
+            <label class="checkbox-line">
+              <input id="dryRun" type="checkbox" />
+              <span>dry-run</span>
+            </label>
+            <label class="checkbox-line">
+              <input id="createMissingTables" type="checkbox" />
+              <span>缺表自动建表</span>
+            </label>
+          </div>
+
+          <div class="big-table-grid">
+            <label>
+              <span>同步方式</span>
+              <select id="syncStrategy" class="control">
+                <option value="offset">普通分页</option>
+                <option value="cursor">大表游标</option>
+              </select>
+            </label>
+            <label>
+              <span>游标字段</span>
+              <input id="cursorField" class="control" placeholder="默认主键" />
+            </label>
+            <label>
+              <span>增量字段</span>
+              <input id="incrementalField" class="control" placeholder="updated_at" />
+            </label>
+            <label>
+              <span>增量起点</span>
+              <input id="incrementalSince" class="control" placeholder="2026-07-01 00:00:00" />
+            </label>
+            <label>
+              <span>分片数</span>
+              <input id="shardCount" class="control" type="number" min="1" max="64" value="2" />
+            </label>
+            <label>
+              <span>并发数</span>
+              <input id="workerCount" class="control" type="number" min="1" max="8" value="2" />
+            </label>
+            <label class="checkbox-line">
+              <input id="skipExactCount" type="checkbox" />
+              <span>跳过精确 count</span>
+            </label>
+          </div>
+
+          <label class="where-box">
+            <span>where</span>
+            <textarea id="whereClause" class="control" rows="3" placeholder="例如 created_at >= '2026-07-01'"></textarea>
+          </label>
+
+          <div class="save-row">
+            <input id="jobName" class="control" type="text" placeholder="常用任务名称" />
+            <label class="checkbox-line compact">
+              <input id="scheduleEnabled" type="checkbox" />
+              <span>定时</span>
+            </label>
+            <input id="cronExpr" class="control cron" type="text" placeholder="0 2 * * *" />
+            <button id="saveJobBtn" class="secondary">保存任务</button>
+          </div>
+        </section>
+
+        <section class="panel plan-panel">
+          <div class="panel-head">
+            <h2>同步计划</h2>
+            <span id="planSummary" class="muted">尚未生成</span>
+          </div>
+          <div id="planWarnings" class="warning-list"></div>
+          <div class="scroll-box">
+            <table>
+              <thead>
+                <tr>
+                  <th>表</th>
+              <th>动作</th>
+              <th>行数</th>
+              <th>分片</th>
+              <th>主键</th>
+            </tr>
+              </thead>
+              <tbody id="planBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel run-panel">
+          <div class="panel-head">
+            <div>
+              <h2>当前运行</h2>
+              <span id="runStatus" class="muted">无</span>
+            </div>
+            <button id="resumeBtn" class="secondary hidden">继续</button>
+          </div>
+          <div id="runMetrics" class="metric-grid"></div>
+          <div class="progress-shell">
+            <div id="progressBar" class="progress-bar"></div>
+          </div>
+          <div id="runTables" class="run-tables"></div>
+          <pre id="runLogs" class="logs"></pre>
+        </section>
+      </section>
+
+      <aside class="panel job-panel">
+        <div class="panel-head">
+          <h2>常用任务</h2>
+          <button id="reloadJobsBtn" class="secondary">刷新</button>
+        </div>
+        <div id="jobList" class="job-list"></div>
+        <div class="panel-head history-head">
+          <h2>历史</h2>
+          <button id="reloadRunsBtn" class="secondary">刷新</button>
+        </div>
+        <div id="runHistory" class="history-list"></div>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
