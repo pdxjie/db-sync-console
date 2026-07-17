@@ -1,0 +1,40 @@
+{
+  "name": "db-sync-console",
+  "version": "0.1.0",
+  "description": "Desktop shell for DB Sync Console.",
+  "main": "desktop/main.cjs",
+  "private": true,
+  "scripts": {
+    "desktop": "electron .",
+    "desktop:dev": "electron .",
+    "desktop:pack": "electron-builder --mac dir",
+    "desktop:dist": "electron-builder --mac dmg"
+  },
+  "build": {
+    "appId": "com.pdxjie.dbsyncconsole",
+    "productName": "DB Sync Console",
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "sync_tool/**/*",
+      ".venv/**/*",
+      "requirements.txt",
+      "config.example.json",
+      "README.md"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dir",
+        "dmg"
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "22.3.27",
+    "electron-builder": "24.13.3"
+  }
+}

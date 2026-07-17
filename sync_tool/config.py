@@ -72,8 +72,8 @@ class AppConfig:
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> "AppConfig":
         raw = raw or {}
-        data_dir = Path(str(raw.get("data_dir", "./data")))
-        log_dir = Path(str(raw.get("log_dir", "./logs")))
+        data_dir = Path(str(os.getenv("DB_SYNC_DATA_DIR") or raw.get("data_dir", "./data")))
+        log_dir = Path(str(os.getenv("DB_SYNC_LOG_DIR") or raw.get("log_dir", "./logs")))
         if not data_dir.is_absolute():
             data_dir = base_dir / data_dir
         if not log_dir.is_absolute():

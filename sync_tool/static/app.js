@@ -4,6 +4,7 @@ const state = {
   currentRunId: null,
   pollTimer: null,
   connectionReady: false,
+  desktop: Boolean(window.dbSyncDesktop?.isDesktop),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -645,4 +646,7 @@ async function refreshAll() {
 }
 
 bindEvents();
+if (state.desktop) {
+  document.body.classList.add("desktop-app");
+}
 refreshAll();

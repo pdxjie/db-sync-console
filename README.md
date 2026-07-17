@@ -27,6 +27,56 @@ data/sync_console.db
 
 页面不会回显密码；如果已经保存过密码，密码框留空再保存会沿用原密码。
 
+## Mac 桌面应用
+
+桌面版使用 Electron 作为 macOS 窗口壳，启动时会自动拉起本地 FastAPI 后端，并打开 DB Sync Console。后端使用随机本地端口，不会和 `8765` 的浏览器版抢端口。
+
+安装桌面依赖：
+
+```bash
+npm install
+```
+
+如果 Electron 默认下载源较慢，可以使用镜像：
+
+```bash
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
+```
+
+启动桌面版：
+
+```bash
+npm run desktop
+```
+
+打包 macOS 应用目录：
+
+```bash
+npm run desktop:pack
+```
+
+生成路径：
+
+```text
+release/mac/DB Sync Console.app
+```
+
+打包 dmg：
+
+```bash
+npm run desktop:dist
+```
+
+当前桌面版仍依赖本机 Python 环境和 `.venv` 中的后端依赖。Apple Silicon 上会优先用 `arch -arm64` 启动 Python，避免 Electron x64 与 Python arm64 依赖架构不一致。
+
+如果打包时本机 `~/.npmrc` 权限异常，可以临时绕开：
+
+```bash
+NPM_CONFIG_USERCONFIG=/dev/null ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm run desktop:pack
+```
+
+当前 `.app` 未签名，首次打开可能需要在 macOS 安全设置里允许运行。后续产品化需要补应用图标和 Developer ID 签名。
+
 ## 可选高级配置
 
 默认不需要 `config.json`。如果想调整分页默认值、日志目录、结构校验或禁止同步的表，可以复制示例：
