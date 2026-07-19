@@ -48,6 +48,19 @@ import "./styles.css";
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
 const APP_NAME = "Data Sync Studio";
+const DEFAULT_SYNC_VALUES = {
+  mode: "replace",
+  batch_size: 1000,
+  create_missing_tables: false,
+  sync_strategy: "offset",
+  cursor_field: "",
+  incremental_field: "",
+  incremental_since: "",
+  skip_exact_count: false,
+  shard_count: 2,
+  worker_count: 2,
+  where_clause: "",
+};
 
 const API_BASE = window.dbSyncDesktop?.apiBase || "";
 
@@ -109,7 +122,7 @@ function AppShell() {
   const [syncForm] = Form.useForm();
   const [jobForm] = Form.useForm();
   const [busy, setBusy] = useState(false);
-  const syncStrategy = Form.useWatch("sync_strategy", syncForm) || "offset";
+  const [syncStrategy, setSyncStrategy] = useState(DEFAULT_SYNC_VALUES.sync_strategy);
 
   const connectionReady = Boolean(status?.connection_ready);
   const selectedCount = selectedTables.length;
@@ -183,11 +196,22 @@ function AppShell() {
     return () => clearTimeout(timer);
   }, [currentRun]);
 
-  const syncValues = () => ({
-    tables: selectedTables,
-    name: jobForm.getFieldValue("name") || null,
-    ...syncForm.getFieldsValue(),
-  });
+  function changeSyncStrategy(value) {
+    setSyncStrategy(value);
+    syncForm.setFieldValue("sync_strategy", value);
+    setPlan(null);
+  }
+
+  const syncValues = () => {
+    const values = syncForm.getFieldsValue(true);
+    return {
+      ...DEFAULT_SYNC_VALUES,
+      ...values,
+      sync_strategy: syncStrategy,
+      tables: selectedTables,
+      name: jobForm.getFieldValue("name") || null,
+    };
+  };
 
   async function buildPlan() {
     const payload = syncValues();
@@ -270,13 +294,15 @@ function AppShell() {
   }
 
   function loadJob(job) {
+    const nextStrategy = job.sync_strategy || DEFAULT_SYNC_VALUES.sync_strategy;
     setSelectedTables(job.tables || []);
+    setSyncStrategy(nextStrategy);
     syncForm.setFieldsValue({
       mode: job.mode,
       where_clause: job.where_clause,
       batch_size: job.batch_size,
       create_missing_tables: job.create_missing_tables,
-      sync_strategy: job.sync_strategy,
+      sync_strategy: nextStrategy,
       cursor_field: job.cursor_field,
       incremental_field: job.incremental_field,
       incremental_since: job.incremental_since,
@@ -435,7 +461,7 @@ function AppShell() {
                 { label: "普通同步", value: "offset" },
                 { label: "大表模式", value: "cursor" },
               ]}
-              onChange={(value) => syncForm.setFieldValue("sync_strategy", value)}
+              onChange={changeSyncStrategy}
             />
             <Space className="primary-actions">
               <Button title="生成计划" icon={<CloudSyncOutlined />} onClick={buildPlan} loading={busy}>
@@ -456,20 +482,11 @@ function AppShell() {
               <Form
                 form={syncForm}
                 layout="vertical"
-                initialValues={{
-                  mode: "replace",
-                  batch_size: 1000,
-                  create_missing_tables: false,
-                  sync_strategy: "offset",
-                  cursor_field: "",
-                  incremental_field: "",
-                  incremental_since: "",
-                  skip_exact_count: false,
-                  shard_count: 2,
-                  worker_count: 2,
-                  where_clause: "",
-                }}
+                initialValues={DEFAULT_SYNC_VALUES}
               >
+                <Form.Item name="sync_strategy" hidden>
+                  <Input />
+                </Form.Item>
                 <div className="sync-form-grid">
                   <Form.Item label="写入模式" name="mode">
                     <Select
