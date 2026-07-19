@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from math import ceil
 from threading import Lock
+from time import monotonic
 from typing import Any, Callable
 
 from . import mysql
@@ -16,6 +17,8 @@ VALID_MODES = {"replace", "upsert"}
 VALID_STRATEGIES = {"offset", "cursor"}
 MAX_WORKERS = 8
 MAX_SHARDS = 64
+RECOMMENDED_CURSOR_BATCH_SIZE = 5000
+PROGRESS_AGGREGATE_INTERVAL_SECONDS = 1.5
 
 
 class SyncPlanError(RuntimeError):
@@ -143,6 +146,10 @@ class SyncEngine:
                 shards = []
                 effective_shard_count = 1
                 if sync_strategy == "cursor":
+                    if batch_size < RECOMMENDED_CURSOR_BATCH_SIZE:
+                        table_warnings.append(
+                            f"batch size {batch_size} is small for big table mode; consider {RECOMMENDED_CURSOR_BATCH_SIZE}+"
+                        )
                     resolved_cursor = cursor_field.strip() or (primary_keys[0] if primary_keys else "")
                     if not resolved_cursor:
                         raise SyncPlanError(f"Table {table} has no primary key; choose a cursor field for big table mode.")
@@ -310,7 +317,7 @@ class SyncEngine:
             self._complete_dry_run(run_id)
             return
 
-        self.store.update_run(run_id, status="running", started_at=run["started_at"] or utc_now(), error=None)
+        self.store.update_run(run_id, fetch=False, status="running", started_at=run["started_at"] or utc_now(), error=None)
         self.log(run_id, "info", "Sync started.")
         if run.get("sync_strategy") == "cursor":
             self._execute_cursor_run(run_id, resume=resume)
@@ -326,8 +333,8 @@ class SyncEngine:
                 if resume and table_state["status"] == "success":
                     continue
 
-                self.store.update_run(run_id, current_table=table)
-                self.store.update_run_table(run_id, table, status="running", error=None)
+                self.store.update_run(run_id, fetch=False, current_table=table)
+                self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
                 prod_columns = mysql.describe_columns(prod_conn, table)
                 columns = mysql.column_names(prod_columns)
                 primary_keys = mysql.primary_key_columns(prod_conn, table)
@@ -382,6 +389,7 @@ class SyncEngine:
                     self.store.update_run_table(
                         run_id,
                         table,
+                        fetch=False,
                         processed_rows=processed,
                         processed_bytes=processed_bytes,
                         offset_value=offset,
@@ -393,6 +401,7 @@ class SyncEngine:
                 self.store.update_run_table(
                     run_id,
                     table,
+                    fetch=False,
                     processed_rows=min(processed, total_rows),
                     processed_bytes=processed_bytes,
                     offset_value=min(offset, total_rows),
@@ -403,6 +412,7 @@ class SyncEngine:
 
             self.store.update_run(
                 run_id,
+                fetch=False,
                 status="success",
                 current_table=None,
                 processed_rows=self.store.sum_processed_rows(run_id),
@@ -432,8 +442,8 @@ class SyncEngine:
                 current_table = table
                 if resume and table_state["status"] == "success":
                     continue
-                self.store.update_run(run_id, current_table=table)
-                self.store.update_run_table(run_id, table, status="running", error=None)
+                self.store.update_run(run_id, fetch=False, current_table=table)
+                self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
 
                 prod_conn = mysql.connect(self.config.prod)
                 test_conn = mysql.connect(self.config.test)
@@ -467,7 +477,11 @@ class SyncEngine:
                     ]
 
                 worker_count = max(1, min(int(run.get("worker_count") or 1), len(shards), MAX_WORKERS))
-                self.log(run_id, "info", f"{table}: cursor sync using {len(shards)} shard(s), {worker_count} worker(s).")
+                self.log(
+                    run_id,
+                    "info",
+                    f"{table}: cursor sync using {len(shards)} shard(s), {worker_count} worker(s), batch size {run['batch_size']}.",
+                )
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     futures = []
                     for shard in shards:
@@ -495,6 +509,7 @@ class SyncEngine:
 
             self.store.update_run(
                 run_id,
+                fetch=False,
                 status="success",
                 current_table=None,
                 processed_rows=self.store.sum_processed_rows(run_id),
@@ -506,8 +521,8 @@ class SyncEngine:
         except Exception as exc:
             message = str(exc)
             if current_table:
-                self.store.update_run_table(run_id, current_table, status="failed", error=message)
-            self.store.update_run(run_id, status="failed", error=message, finished_at=utc_now())
+                self.store.update_run_table(run_id, current_table, fetch=False, status="failed", error=message)
+            self.store.update_run(run_id, fetch=False, status="failed", error=message, finished_at=utc_now())
             self.log(run_id, "error", message)
             raise
 
@@ -529,8 +544,15 @@ class SyncEngine:
         processed = int(shard.get("processed_rows") or 0)
         processed_bytes = int(shard.get("processed_bytes") or 0)
         last_pk = shard.get("last_pk")
+        extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
+        last_aggregate_at = monotonic()
         try:
-            self.store.update_run_shard(run_id, table, shard_index, status="running", error=None)
+            self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="running", error=None)
+            self.log(
+                run_id,
+                "info",
+                f"{table} shard {shard_index}: range {shard.get('start_pk') or '-'}..{shard.get('end_pk') or '-'}, resume from {last_pk or '-'}.",
+            )
             while True:
                 rows = mysql.fetch_cursor_batch(
                     prod_conn,
@@ -542,7 +564,7 @@ class SyncEngine:
                     last_pk=last_pk,
                     shard_start=shard.get("start_pk"),
                     shard_end=shard.get("end_pk"),
-                    extra_conditions=self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", "")),
+                    extra_conditions=extra_conditions,
                 )
                 if not rows:
                     break
@@ -563,18 +585,23 @@ class SyncEngine:
                     run_id,
                     table,
                     shard_index,
+                    fetch=False,
                     last_pk=last_pk,
                     processed_rows=processed,
                     processed_bytes=processed_bytes,
                     status="running",
                 )
-                self.store.aggregate_shards(run_id, table)
-                self._refresh_run_progress(run_id)
+                now = monotonic()
+                if now - last_aggregate_at >= PROGRESS_AGGREGATE_INTERVAL_SECONDS:
+                    self.store.aggregate_shards(run_id, table)
+                    self._refresh_run_progress(run_id)
+                    last_aggregate_at = now
 
             self.store.update_run_shard(
                 run_id,
                 table,
                 shard_index,
+                fetch=False,
                 last_pk=last_pk,
                 processed_rows=processed,
                 processed_bytes=processed_bytes,
@@ -585,7 +612,7 @@ class SyncEngine:
             self.log(run_id, "info", f"{table} shard {shard_index}: {processed} row(s) synced, last_pk={last_pk}.")
         except Exception as exc:
             test_conn.rollback()
-            self.store.update_run_shard(run_id, table, shard_index, status="failed", error=str(exc))
+            self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="failed", error=str(exc))
             raise
         finally:
             prod_conn.close()
@@ -632,12 +659,13 @@ class SyncEngine:
             self.log(run["id"], "info", f"{table}: truncated test table.")
 
     def _complete_dry_run(self, run_id: str) -> None:
-        self.store.update_run(run_id, status="running", started_at=utc_now())
+        self.store.update_run(run_id, fetch=False, status="running", started_at=utc_now())
         self.log(run_id, "info", "Dry run completed. No data was written to test.")
         for table_state in self.store.get_run_tables(run_id):
             self.store.update_run_table(
                 run_id,
                 table_state["table_name"],
+                fetch=False,
                 status="success",
                 processed_rows=0,
                 offset_value=0,
@@ -647,15 +675,17 @@ class SyncEngine:
                     run_id,
                     table_state["table_name"],
                     int(shard["shard_index"]),
+                    fetch=False,
                     status="success",
                     processed_rows=0,
                     processed_bytes=0,
                 )
-        self.store.update_run(run_id, status="success", finished_at=utc_now(), current_table=None)
+        self.store.update_run(run_id, fetch=False, status="success", finished_at=utc_now(), current_table=None)
 
     def _refresh_run_progress(self, run_id: str) -> None:
         self.store.update_run(
             run_id,
+            fetch=False,
             processed_rows=self.store.sum_processed_rows(run_id),
             processed_bytes=self.store.sum_processed_bytes(run_id),
         )

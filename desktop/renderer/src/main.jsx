@@ -48,6 +48,7 @@ import "./styles.css";
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
 const APP_NAME = "Data Sync Studio";
+const BIG_TABLE_BATCH_SIZE = 5000;
 const DEFAULT_SYNC_VALUES = {
   mode: "replace",
   batch_size: 1000,
@@ -198,7 +199,13 @@ function AppShell() {
 
   function changeSyncStrategy(value) {
     setSyncStrategy(value);
-    syncForm.setFieldValue("sync_strategy", value);
+    const currentBatchSize = Number(syncForm.getFieldValue("batch_size") || 0);
+    syncForm.setFieldsValue({
+      sync_strategy: value,
+      ...(value === "cursor" && currentBatchSize <= DEFAULT_SYNC_VALUES.batch_size
+        ? { batch_size: BIG_TABLE_BATCH_SIZE }
+        : {}),
+    });
     setPlan(null);
   }
 
@@ -630,6 +637,7 @@ function RunPanel({ run, percent, onResume }) {
     return <Empty className="pane-empty" description="尚无运行" />;
   }
   const statusColor = run.status === "success" ? "success" : run.status === "failed" ? "error" : "processing";
+  const shards = run.shards_state || [];
   return (
     <div className="run-panel">
       <Space direction="vertical" size={12} className="full-width">
@@ -669,6 +677,30 @@ function RunPanel({ run, percent, onResume }) {
             </List.Item>
           )}
         />
+        {shards.length ? (
+          <div className="shard-panel">
+            <Text strong>分片进度</Text>
+            <List
+              size="small"
+              dataSource={shards}
+              renderItem={(shard) => (
+                <List.Item>
+                  <List.Item.Meta
+                    title={
+                      <Space>
+                        <Text>#{shard.shard_index}</Text>
+                        <Tag>{shard.status}</Tag>
+                      </Space>
+                    }
+                    description={`${formatNumber(shard.processed_rows)} 行 · range ${
+                      shard.start_pk || "-"
+                    }..${shard.end_pk || "-"} · last_pk ${shard.last_pk || "-"}`}
+                  />
+                </List.Item>
+              )}
+            />
+          </div>
+        ) : null}
         <pre className="log-box">
           {(run.logs || [])
             .map((item) => `${item.created_at} [${item.level.toUpperCase()}] ${item.message}`)

@@ -229,6 +229,17 @@ body {
   white-space: pre-wrap;
 }
 
+.shard-panel {
+  padding: 10px;
+  border: 1px solid #dbe3ec;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.shard-panel .ant-list-item {
+  padding-inline: 0;
+}
+
 .job-save-grid {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
