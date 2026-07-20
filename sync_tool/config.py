@@ -23,12 +23,12 @@ class MySQLConfig:
     def from_dict(cls, raw: dict[str, Any] | None) -> "MySQLConfig":
         raw = raw or {}
         return cls(
-            host=str(raw.get("host", "")),
+            host=str(raw.get("host", "")).strip(),
             port=int(raw.get("port", 3306)),
-            user=str(raw.get("user", "")),
+            user=str(raw.get("user", "")).strip(),
             password=str(raw.get("password", "")),
-            database=str(raw.get("database", "")),
-            charset=str(raw.get("charset", "utf8mb4")),
+            database=str(raw.get("database", "")).strip(),
+            charset=str(raw.get("charset", "utf8mb4")).strip(),
             connect_timeout=int(raw.get("connect_timeout", 10)),
             read_timeout=int(raw.get("read_timeout", 120)),
             write_timeout=int(raw.get("write_timeout", 120)),

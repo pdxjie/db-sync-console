@@ -307,7 +307,27 @@ def _connection_config(env: str, payload: ConnectionPayload) -> tuple[dict, MySQ
         missing.append("database")
     if missing:
         raise HTTPException(status_code=400, detail=f"{env} connection missing: {', '.join(missing)}")
+    _validate_connection_host(env, config.host)
     return raw, config
+
+
+def _validate_connection_host(env: str, host: str) -> None:
+    if host.endswith(".comz"):
+        suggestion = f"{host[:-1]}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"{env} host looks invalid: {host}. Did you mean {suggestion}?",
+        )
+    if "://" in host or "/" in host:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{env} host should be a hostname only, not a URL: {host}",
+        )
+    if ":" in host:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{env} host should not include a port. Put the port in the Port field instead: {host}",
+        )
 
 
 def _model_dump(model: BaseModel) -> dict:

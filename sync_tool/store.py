@@ -699,12 +699,12 @@ class SyncStore:
         if (password is None or password == "") and existing.get("password"):
             password = existing["password"]
         return {
-            "host": str(payload.get("host") or existing.get("host") or ""),
+            "host": str(payload.get("host") or existing.get("host") or "").strip(),
             "port": int(payload.get("port") or existing.get("port") or 3306),
-            "user": str(payload.get("user") or existing.get("user") or ""),
+            "user": str(payload.get("user") or existing.get("user") or "").strip(),
             "password": str(password or ""),
-            "database": str(payload.get("database") or existing.get("database") or ""),
-            "charset": str(payload.get("charset") or existing.get("charset") or "utf8mb4"),
+            "database": str(payload.get("database") or existing.get("database") or "").strip(),
+            "charset": str(payload.get("charset") or existing.get("charset") or "utf8mb4").strip(),
             "connect_timeout": int(payload.get("connect_timeout") or existing.get("connect_timeout") or 10),
             "read_timeout": int(payload.get("read_timeout") or existing.get("read_timeout") or 120),
             "write_timeout": int(payload.get("write_timeout") or existing.get("write_timeout") or 120),
