@@ -67,7 +67,7 @@ class AppConfig:
     data_dir: Path = Path("./data")
     log_dir: Path = Path("./logs")
     timezone: str = "Asia/Shanghai"
-    strict_schema: bool = True
+    strict_schema: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> "AppConfig":
@@ -83,7 +83,7 @@ class AppConfig:
             data_dir=data_dir,
             log_dir=log_dir,
             timezone=str(raw.get("timezone", "Asia/Shanghai")),
-            strict_schema=bool(raw.get("strict_schema", True)),
+            strict_schema=bool(raw.get("strict_schema", False)),
         )
 
 

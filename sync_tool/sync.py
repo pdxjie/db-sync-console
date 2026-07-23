@@ -108,16 +108,61 @@ class SyncEngine:
                     test_columns = prod_columns
                     table_warnings.append("test table is missing; it will be created from product table structure")
 
-                if not target_missing:
+                prod_column_names = mysql.column_names(prod_columns)
+                target_primary_keys = []
+                if target_missing:
+                    column_plan = {
+                        "write_columns": prod_column_names,
+                        "source_only_columns": [],
+                        "target_only_columns": [],
+                        "type_mismatches": [],
+                        "required_target_only_columns": [],
+                    }
+                else:
                     schema_errors = mysql.compare_column_shapes(prod_columns, test_columns)
                     if schema_errors and self.config.app.strict_schema:
                         raise SyncPlanError(f"Schema mismatch for {table}: {'; '.join(schema_errors)}")
-                    table_warnings.extend(schema_errors)
+                    column_plan = mysql.sync_column_plan(prod_columns, test_columns)
+                    target_primary_keys = mysql.primary_key_columns(test_conn, table)
+                    if not column_plan["write_columns"]:
+                        raise SyncPlanError(f"Table {table} has no common columns between product and test.")
+                    if column_plan["source_only_columns"]:
+                        table_warnings.append(
+                            "source-only columns will be skipped: " + ", ".join(column_plan["source_only_columns"])
+                        )
+                    if column_plan["target_only_columns"]:
+                        table_warnings.append(
+                            "test-only columns will be preserved by schema and not written: "
+                            + ", ".join(column_plan["target_only_columns"])
+                        )
+                    if column_plan["required_target_only_columns"]:
+                        table_warnings.append(
+                            "test-only required columns without defaults may reject new rows: "
+                            + ", ".join(column_plan["required_target_only_columns"])
+                        )
+                    for mismatch in column_plan["type_mismatches"]:
+                        table_warnings.append(
+                            "common column type differs and will rely on MySQL conversion: "
+                            f"{mismatch['name']} prod={mismatch['prod_type']} test={mismatch['test_type']}"
+                        )
 
                 primary_keys = mysql.primary_key_columns(prod_conn, table)
-                prod_column_names = mysql.column_names(prod_columns)
-                if mode == "upsert" and not primary_keys:
-                    raise SyncPlanError(f"Table {table} has no primary key; upsert cannot be used.")
+                if target_missing:
+                    target_primary_keys = primary_keys
+                write_primary_keys = target_primary_keys or primary_keys
+                if mode == "upsert" and not target_primary_keys:
+                    raise SyncPlanError(f"Table {table} has no target primary key; upsert cannot be used.")
+                missing_write_keys = [key for key in write_primary_keys if key not in column_plan["write_columns"]]
+                if mode == "upsert" and missing_write_keys:
+                    raise SyncPlanError(
+                        f"Table {table} target primary key column(s) are not available from product data: "
+                        + ", ".join(missing_write_keys)
+                    )
+                if target_primary_keys and primary_keys and target_primary_keys != primary_keys:
+                    table_warnings.append(
+                        "test primary key differs from product primary key; upsert will use test primary key: "
+                        + ", ".join(target_primary_keys)
+                    )
                 if not primary_keys:
                     table_warnings.append("table has no primary key; pagination order is not stable")
 
@@ -150,7 +195,13 @@ class SyncEngine:
                         table_warnings.append(
                             f"batch size {batch_size} is small for big table mode; consider {RECOMMENDED_CURSOR_BATCH_SIZE}+"
                         )
-                    resolved_cursor = cursor_field.strip() or (primary_keys[0] if primary_keys else "")
+                    resolved_cursor = cursor_field.strip() or (
+                        primary_keys[0]
+                        if primary_keys
+                        else target_primary_keys[0]
+                        if target_primary_keys and target_primary_keys[0] in prod_column_names
+                        else ""
+                    )
                     if not resolved_cursor:
                         raise SyncPlanError(f"Table {table} has no primary key; choose a cursor field for big table mode.")
                     resolved_cursor = mysql.validate_identifier(resolved_cursor)
@@ -188,8 +239,14 @@ class SyncEngine:
                         "estimated": not precise_count,
                         "total_bytes": row_bytes,
                         "avg_row_length": avg_row_length,
-                        "columns": prod_column_names,
+                        "columns": column_plan["write_columns"],
+                        "source_columns": prod_column_names,
+                        "target_columns": mysql.column_names(test_columns),
+                        "source_only_columns": column_plan["source_only_columns"],
+                        "target_only_columns": column_plan["target_only_columns"],
                         "primary_keys": primary_keys,
+                        "target_primary_keys": target_primary_keys,
+                        "write_primary_keys": write_primary_keys,
                         "create_missing_table": target_missing,
                         "sync_strategy": sync_strategy,
                         "cursor_field": resolved_cursor,
@@ -335,27 +392,18 @@ class SyncEngine:
 
                 self.store.update_run(run_id, fetch=False, current_table=table)
                 self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
-                prod_columns = mysql.describe_columns(prod_conn, table)
-                columns = mysql.column_names(prod_columns)
-                primary_keys = mysql.primary_key_columns(prod_conn, table)
                 extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
                 offset = int(table_state["offset_value"]) if resume else 0
                 processed = int(table_state["processed_rows"]) if resume else 0
                 processed_bytes = int(table_state.get("processed_bytes") or 0) if resume else 0
                 total_rows = int(table_state["total_rows"])
 
-                target_created = False
-                if not mysql.table_exists(test_conn, table):
-                    if not run["create_missing_tables"]:
-                        raise SyncPlanError(
-                            f"Test database table is missing or not visible: {table}. "
-                            "Enable 'create missing test tables' and start a new run."
-                        )
-                    ddl = mysql.show_create_table(prod_conn, table)
-                    mysql.create_table_from_ddl(test_conn, ddl)
-                    test_conn.commit()
-                    target_created = True
-                    self.log(run_id, "info", f"{table}: created test table from product structure.")
+                target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
+                column_info = self._resolve_table_columns(prod_conn, test_conn, run, table)
+                fetch_columns = column_info["fetch_columns"]
+                write_columns = column_info["write_columns"]
+                order_columns = column_info["source_primary_keys"]
+                write_primary_keys = column_info["write_primary_keys"]
 
                 if offset == 0 and not target_created:
                     self._prepare_destination_table(test_conn, run, table, extra_conditions)
@@ -364,9 +412,9 @@ class SyncEngine:
                     rows = mysql.fetch_batch(
                         prod_conn,
                         table,
-                        columns,
+                        fetch_columns,
                         run["where_clause"],
-                        primary_keys,
+                        order_columns,
                         int(run["batch_size"]),
                         offset,
                         extra_conditions,
@@ -375,14 +423,14 @@ class SyncEngine:
                         break
 
                     if run["mode"] == "replace":
-                        mysql.insert_rows(test_conn, table, columns, rows)
+                        mysql.insert_rows(test_conn, table, write_columns, rows)
                     elif run["mode"] == "upsert":
-                        mysql.upsert_rows(test_conn, table, columns, primary_keys, rows)
+                        mysql.upsert_rows(test_conn, table, write_columns, write_primary_keys, rows)
                     else:
                         raise SyncPlanError(f"Unsupported mode: {run['mode']}")
 
                     test_conn.commit()
-                    batch_bytes = self._estimate_rows_bytes(rows, columns)
+                    batch_bytes = self._estimate_rows_bytes(rows, write_columns)
                     offset += len(rows)
                     processed += len(rows)
                     processed_bytes += batch_bytes
@@ -448,14 +496,24 @@ class SyncEngine:
                 prod_conn = mysql.connect(self.config.prod)
                 test_conn = mysql.connect(self.config.test)
                 try:
-                    prod_columns = mysql.describe_columns(prod_conn, table)
-                    columns = mysql.column_names(prod_columns)
-                    primary_keys = mysql.primary_key_columns(prod_conn, table)
                     extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
                     should_prepare = not resume or int(table_state.get("processed_rows") or 0) == 0
+                    target_created = False
                     if should_prepare:
-                        self._ensure_destination_table(prod_conn, test_conn, run, table)
-                        self._prepare_destination_table(test_conn, run, table, extra_conditions)
+                        target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
+                        if not target_created:
+                            self._prepare_destination_table(test_conn, run, table, extra_conditions)
+                    cursor_field = table_state.get("cursor_field") or run.get("cursor_field", "")
+                    column_info = self._resolve_table_columns(
+                        prod_conn,
+                        test_conn,
+                        run,
+                        table,
+                        cursor_field=cursor_field,
+                    )
+                    fetch_columns = column_info["fetch_columns"]
+                    write_columns = column_info["write_columns"]
+                    write_primary_keys = column_info["write_primary_keys"]
                 finally:
                     prod_conn.close()
                     test_conn.close()
@@ -493,8 +551,9 @@ class SyncEngine:
                                 run,
                                 table,
                                 shard,
-                                columns,
-                                primary_keys,
+                                fetch_columns,
+                                write_columns,
+                                write_primary_keys,
                             )
                         )
                     for future in as_completed(futures):
@@ -531,8 +590,9 @@ class SyncEngine:
         run: dict[str, Any],
         table: str,
         shard: dict[str, Any],
-        columns: list[str],
-        primary_keys: list[str],
+        fetch_columns: list[str],
+        write_columns: list[str],
+        write_primary_keys: list[str],
     ) -> None:
         run_id = run["id"]
         shard_index = int(shard["shard_index"])
@@ -557,7 +617,7 @@ class SyncEngine:
                 rows = mysql.fetch_cursor_batch(
                     prod_conn,
                     table,
-                    columns,
+                    fetch_columns,
                     run["where_clause"],
                     cursor_field,
                     int(run["batch_size"]),
@@ -570,14 +630,14 @@ class SyncEngine:
                     break
 
                 if run["mode"] == "replace":
-                    mysql.insert_rows(test_conn, table, columns, rows)
+                    mysql.insert_rows(test_conn, table, write_columns, rows)
                 elif run["mode"] == "upsert":
-                    mysql.upsert_rows(test_conn, table, columns, primary_keys, rows)
+                    mysql.upsert_rows(test_conn, table, write_columns, write_primary_keys, rows)
                 else:
                     raise SyncPlanError(f"Unsupported mode: {run['mode']}")
 
                 test_conn.commit()
-                batch_bytes = self._estimate_rows_bytes(rows, columns)
+                batch_bytes = self._estimate_rows_bytes(rows, write_columns)
                 processed += len(rows)
                 processed_bytes += batch_bytes
                 last_pk = rows[-1][cursor_field]
@@ -639,6 +699,51 @@ class SyncEngine:
         test_conn.commit()
         self.log(run["id"], "info", f"{table}: created test table from product structure.")
         return True
+
+    def _resolve_table_columns(
+        self,
+        prod_conn,
+        test_conn,
+        run: dict[str, Any],
+        table: str,
+        *,
+        cursor_field: str = "",
+    ) -> dict[str, Any]:
+        prod_columns = mysql.describe_columns(prod_conn, table)
+        test_columns = mysql.describe_columns(test_conn, table)
+        column_plan = mysql.sync_column_plan(prod_columns, test_columns)
+        write_columns = column_plan["write_columns"]
+        if not write_columns:
+            raise SyncPlanError(f"Table {table} has no common columns between product and test.")
+
+        source_primary_keys = mysql.primary_key_columns(prod_conn, table)
+        target_primary_keys = mysql.primary_key_columns(test_conn, table)
+        write_primary_keys = target_primary_keys or source_primary_keys
+        if run["mode"] == "upsert":
+            if not target_primary_keys:
+                raise SyncPlanError(f"Table {table} has no target primary key; upsert cannot be used.")
+            missing_write_keys = [key for key in write_primary_keys if key not in write_columns]
+            if missing_write_keys:
+                raise SyncPlanError(
+                    f"Table {table} target primary key column(s) are not available from product data: "
+                    + ", ".join(missing_write_keys)
+                )
+
+        fetch_columns = list(write_columns)
+        if cursor_field and cursor_field not in fetch_columns:
+            if cursor_field not in mysql.column_names(prod_columns):
+                raise SyncPlanError(f"Cursor field {cursor_field} does not exist in {table}.")
+            fetch_columns.append(cursor_field)
+
+        return {
+            "fetch_columns": fetch_columns,
+            "write_columns": write_columns,
+            "source_primary_keys": source_primary_keys,
+            "target_primary_keys": target_primary_keys,
+            "write_primary_keys": write_primary_keys,
+            "source_only_columns": column_plan["source_only_columns"],
+            "target_only_columns": column_plan["target_only_columns"],
+        }
 
     def _prepare_destination_table(
         self,

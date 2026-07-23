@@ -557,6 +557,13 @@ function AppShell() {
                       align: "right",
                       render: (value, row) => `${formatNumber(value)}${row.estimated ? " 估算" : ""}`,
                     },
+                    {
+                      title: "字段",
+                      dataIndex: "columns",
+                      width: 82,
+                      align: "right",
+                      render: (value, row) => `${value?.length || 0}/${row.source_columns?.length || value?.length || 0}`,
+                    },
                     { title: "游标", dataIndex: "cursor_field", width: 90, render: (value) => value || "-" },
                     { title: "分片", dataIndex: "shard_count", width: 70, align: "right" },
                   ]}

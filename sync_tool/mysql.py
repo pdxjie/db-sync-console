@@ -260,6 +260,41 @@ def compare_column_shapes(prod_columns: list[dict[str, Any]], test_columns: list
     return errors
 
 
+def sync_column_plan(prod_columns: list[dict[str, Any]], test_columns: list[dict[str, Any]]) -> dict[str, Any]:
+    prod_by_name = {str(item["name"]): item for item in prod_columns}
+    test_by_name = {str(item["name"]): item for item in test_columns}
+    prod_names = list(prod_by_name)
+    test_names = list(test_by_name)
+    common_columns = [name for name in test_names if name in prod_by_name]
+    source_only_columns = [name for name in prod_names if name not in test_by_name]
+    target_only_columns = [name for name in test_names if name not in prod_by_name]
+    type_mismatches = []
+    for name in common_columns:
+        prod_type = str(prod_by_name[name]["column_type"]).lower()
+        test_type = str(test_by_name[name]["column_type"]).lower()
+        if prod_type != test_type:
+            type_mismatches.append({"name": name, "prod_type": prod_type, "test_type": test_type})
+    return {
+        "write_columns": common_columns,
+        "source_only_columns": source_only_columns,
+        "target_only_columns": target_only_columns,
+        "type_mismatches": type_mismatches,
+        "required_target_only_columns": required_columns_without_defaults(
+            [test_by_name[name] for name in target_only_columns]
+        ),
+    }
+
+
+def required_columns_without_defaults(columns: list[dict[str, Any]]) -> list[str]:
+    required = []
+    for column in columns:
+        nullable = str(column.get("nullable", "")).upper()
+        extra = str(column.get("extra", "")).lower()
+        if nullable == "NO" and column.get("column_default") is None and "auto_increment" not in extra:
+            required.append(str(column["name"]))
+    return required
+
+
 def count_rows(
     conn,
     table: str,

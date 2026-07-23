@@ -88,7 +88,7 @@ cp config.example.json config.json
 然后编辑：
 
 - `app.page_size`：每页同步行数
-- `app.strict_schema`：是否要求两边表结构一致
+- `app.strict_schema`：是否强制两边表结构完全一致，默认 `false`
 - `safety.blocked_tables`：禁止同步的表
 - `safety.max_rows_without_where`：无 `where` 时的大表提醒阈值
 
@@ -127,6 +127,27 @@ python -m sync_tool.cli --config config.json sync \
 
 ```bash
 python -m sync_tool.cli --config config.json resume <run_id>
+```
+
+## 表结构不一致
+
+默认会保留测试库已有表结构，不会因为产品库字段变化去修改测试库字段。
+
+- 产品库和测试库同名字段：参与同步
+- 产品库有、测试库没有的字段：跳过
+- 测试库有、产品库没有的字段：保留字段结构，不写入数据
+- 同名字段类型不一致：计划里提示 warning，执行时交给 MySQL 转换；如果目标字段无法接收数据，MySQL 会报错
+
+如果测试库额外字段是 `NOT NULL` 且没有默认值，新插入行可能失败。这种情况建议给测试库字段设置默认值，或者使用 `upsert` 同步已有行。
+
+如果想恢复旧行为，要求产品库和测试库字段完全一致，可以在 `config.json` 里设置：
+
+```json
+{
+  "app": {
+    "strict_schema": true
+  }
+}
 ```
 
 ## 同步模式
