@@ -1,4 +1,4 @@
-# Data Sync Studio
+# 同步犬 SyncDog
 
 本地数据库同步工作台，用来把产品环境数据库的指定表同步到测试环境。当前 provider 支持 MySQL，后续可以继续扩展 PostgreSQL、SQL Server 等数据库。第一版聚焦 `prod -> test`，支持表搜索勾选、`replace` / `upsert`、`where` 条件、同步计划、`dry-run`、分页、断点继续、日志、常用任务和 crontab 定时任务。
 
@@ -58,7 +58,7 @@ npm run desktop:pack
 生成路径：
 
 ```text
-release/mac/Data Sync Studio.app
+release/mac/同步犬.app
 ```
 
 打包 dmg：

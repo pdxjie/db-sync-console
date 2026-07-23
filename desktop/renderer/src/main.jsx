@@ -47,7 +47,7 @@ import "./styles.css";
 
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
-const APP_NAME = "Data Sync Studio";
+const APP_NAME = "同步犬";
 const BIG_TABLE_BATCH_SIZE = 5000;
 const DEFAULT_SYNC_VALUES = {
   mode: "replace",

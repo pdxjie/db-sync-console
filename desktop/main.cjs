@@ -10,7 +10,11 @@ let backendProcess = null;
 let backendUrl = null;
 
 const isMac = process.platform === "darwin";
-const APP_NAME = "Data Sync Studio";
+const APP_NAME = "同步犬";
+
+function appIconPath() {
+  return path.join(appRootPath(), "assets", "app-icon.icns");
+}
 function appRootPath() {
   if (app.isPackaged) {
     return path.join(process.resourcesPath, "app");
@@ -203,6 +207,7 @@ function createWindow() {
     minHeight: 760,
     title: APP_NAME,
     backgroundColor: "#f4f6f8",
+    icon: appIconPath(),
     titleBarStyle: isMac ? "hiddenInset" : "default",
     trafficLightPosition: { x: 16, y: 18 },
     webPreferences: {
@@ -248,6 +253,9 @@ function createWindow() {
 
 async function boot() {
   app.setName(APP_NAME);
+  if (isMac && fs.existsSync(appIconPath())) {
+    app.dock.setIcon(appIconPath());
+  }
   createMenu();
   const port = await findFreePort();
   backendUrl = `http://127.0.0.1:${port}`;

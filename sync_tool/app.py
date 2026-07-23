@@ -84,7 +84,7 @@ engine = SyncEngine(lambda: effective_config(), store)
 manager = SyncManager(engine)
 scheduler = JobScheduler(base_config, store, manager)
 
-app = FastAPI(title="Data Sync Studio", version="0.1.0")
+app = FastAPI(title="同步犬", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

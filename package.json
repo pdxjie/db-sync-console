@@ -1,7 +1,7 @@
 {
-  "name": "data-sync-studio",
+  "name": "sync-dog",
   "version": "0.1.0",
-  "description": "Desktop database sync studio.",
+  "description": "SyncDog desktop database sync app.",
   "main": "desktop/main.cjs",
   "private": true,
   "scripts": {
@@ -12,14 +12,15 @@
     "desktop:dist": "npm run renderer:build && electron-builder --mac dmg"
   },
   "build": {
-    "appId": "com.pdxjie.datasyncstudio",
-    "productName": "Data Sync Studio",
+    "appId": "com.pdxjie.syncdog",
+    "productName": "同步犬",
     "asar": false,
     "directories": {
       "output": "release"
     },
     "files": [
       "desktop/**/*",
+      "assets/**/*",
       "sync_tool/**/*",
       ".venv/**/*",
       "requirements.txt",
@@ -28,6 +29,7 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "assets/app-icon.icns",
       "target": [
         "dir",
         "dmg"
