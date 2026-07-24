@@ -15,6 +15,10 @@ const APP_NAME = "同步犬";
 function appIconPath() {
   return path.join(appRootPath(), "assets", "app-icon.icns");
 }
+
+function dockIconPath() {
+  return path.join(appRootPath(), "assets", "app-icon.png");
+}
 function appRootPath() {
   if (app.isPackaged) {
     return path.join(process.resourcesPath, "app");
@@ -253,8 +257,12 @@ function createWindow() {
 
 async function boot() {
   app.setName(APP_NAME);
-  if (isMac && fs.existsSync(appIconPath())) {
-    app.dock.setIcon(appIconPath());
+  if (isMac && fs.existsSync(dockIconPath())) {
+    try {
+      app.dock.setIcon(dockIconPath());
+    } catch (error) {
+      console.warn(`[desktop] unable to set dock icon: ${error.message}`);
+    }
   }
   createMenu();
   const port = await findFreePort();
