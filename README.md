@@ -31,6 +31,8 @@ data/sync_console.db
 
 桌面版使用 Electron 启动 macOS 应用窗口，并自动拉起本地 FastAPI 后端作为同步引擎。桌面端使用独立 React/Ant Design renderer，不再直接嵌入浏览器版页面；后端使用随机本地端口，不会和 `8765` 的浏览器版抢端口。
 
+安装后的桌面 App 已内置后端运行时，使用者不需要额外安装 Python、Node.js、npm 或 MySQL 客户端。数据库能否连接仍取决于网络、防火墙、云数据库白名单、VPN 和账号权限。
+
 安装桌面依赖：
 
 ```bash
@@ -47,6 +49,13 @@ ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
 
 ```bash
 npm run desktop
+```
+
+开发模式仍使用本机 Python 虚拟环境，方便调试后端。打包时会使用 PyInstaller 生成独立后端运行时：
+
+```bash
+pip install -r requirements-build.txt
+npm run backend:build
 ```
 
 打包 macOS 应用目录：
@@ -67,7 +76,7 @@ release/mac/同步犬.app
 npm run desktop:dist
 ```
 
-当前桌面版仍依赖本机 Python 环境和 `.venv` 中的后端依赖。Apple Silicon 上会优先用 `arch -arm64` 启动 Python，避免 Electron x64 与 Python arm64 依赖架构不一致。
+打包脚本会按当前 Mac 架构生成应用：Apple Silicon 生成 arm64 包，Intel Mac 生成 x64 包。跨架构分发时需要分别在对应架构环境构建，或者补 universal 构建流程。
 
 如果打包时本机 `~/.npmrc` 权限异常，可以临时绕开：
 

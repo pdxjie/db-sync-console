@@ -8,4 +8,6 @@ logs/
 config.json
 release/
 dist/
+build/
+desktop/backend-dist/
 assets/*.iconset/

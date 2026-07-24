@@ -36,7 +36,14 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["DB_SYNC_CONFIG"] = str(config_path)
         import uvicorn
 
-        uvicorn.run("sync_tool.app:app", host=args.host, port=args.port, reload=False)
+        uvicorn.run(
+            "sync_tool.app:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+            loop="asyncio",
+            http="h11",
+        )
         return 0
 
     config = load_config(config_path, require_exists=True)

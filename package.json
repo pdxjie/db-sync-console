@@ -1,15 +1,16 @@
 {
   "name": "sync-dog",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "SyncDog desktop database sync app.",
   "main": "desktop/main.cjs",
   "private": true,
   "scripts": {
+    "backend:build": "scripts/build_backend_runtime.sh",
     "renderer:build": "vite --config desktop/renderer/vite.config.js build",
     "desktop": "npm run renderer:build && electron .",
     "desktop:dev": "npm run renderer:build && electron .",
-    "desktop:pack": "npm run renderer:build && electron-builder --mac dir",
-    "desktop:dist": "npm run renderer:build && electron-builder --mac dmg"
+    "desktop:pack": "scripts/build_desktop_app.sh dir",
+    "desktop:dist": "scripts/build_desktop_app.sh dmg"
   },
   "build": {
     "appId": "com.pdxjie.syncdog",
@@ -22,8 +23,8 @@
       "desktop/**/*",
       "assets/**/*",
       "sync_tool/**/*",
-      ".venv/**/*",
       "requirements.txt",
+      "requirements-build.txt",
       "config.example.json",
       "README.md"
     ],

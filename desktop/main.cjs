@@ -30,6 +30,31 @@ function userDataPath(...parts) {
   return path.join(app.getPath("userData"), ...parts);
 }
 
+function backendExecutableName() {
+  return process.platform === "win32" ? "syncdog-backend.exe" : "syncdog-backend";
+}
+
+function backendRuntimeCandidates() {
+  const appRoot = appRootPath();
+  const executableName = backendExecutableName();
+  const arch = process.arch === "x64" ? "x64" : process.arch;
+  const candidates = [];
+  if (process.env.DB_SYNC_BACKEND_BINARY) {
+    candidates.push(process.env.DB_SYNC_BACKEND_BINARY);
+  }
+  candidates.push(path.join(appRoot, "desktop", "backend-dist", `${process.platform}-${arch}`, "syncdog-backend", executableName));
+  if (process.platform === "darwin") {
+    candidates.push(path.join(appRoot, "desktop", "backend-dist", "darwin-arm64", "syncdog-backend", executableName));
+    candidates.push(path.join(appRoot, "desktop", "backend-dist", "darwin-x64", "syncdog-backend", executableName));
+  }
+  candidates.push(path.join(appRoot, "desktop", "backend-dist", "syncdog-backend", executableName));
+  return [...new Set(candidates)];
+}
+
+function findBackendRuntime() {
+  return backendRuntimeCandidates().find((candidate) => fs.existsSync(candidate));
+}
+
 function findPython() {
   if (process.env.DB_SYNC_PYTHON) {
     return process.env.DB_SYNC_PYTHON;
@@ -53,6 +78,28 @@ function pythonCommand() {
   return {
     command: python,
     args: [],
+  };
+}
+
+function backendCommand() {
+  const runtime = findBackendRuntime();
+  if (runtime) {
+    return {
+      command: runtime,
+      args: [],
+      kind: "runtime",
+    };
+  }
+  if (app.isPackaged) {
+    throw new Error(
+      `Packaged backend runtime was not found. Looked in: ${backendRuntimeCandidates().join(", ")}`
+    );
+  }
+  const python = pythonCommand();
+  return {
+    command: python.command,
+    args: [...python.args, "-m", "sync_tool.cli"],
+    kind: "python",
   };
 }
 
@@ -95,7 +142,7 @@ function waitForBackend(url, timeoutMs = 30000) {
 }
 
 function startBackend(port) {
-  const python = pythonCommand();
+  const backend = backendCommand();
   const appRoot = appRootPath();
   const env = {
     ...process.env,
@@ -104,9 +151,10 @@ function startBackend(port) {
     DB_SYNC_LOG_DIR: userDataPath("logs"),
     PYTHONUNBUFFERED: "1",
   };
+  console.log(`[desktop] starting backend via ${backend.kind}: ${backend.command}`);
   backendProcess = spawn(
-    python.command,
-    [...python.args, "-m", "sync_tool.cli", "serve", "--host", "127.0.0.1", "--port", String(port)],
+    backend.command,
+    [...backend.args, "serve", "--host", "127.0.0.1", "--port", String(port)],
     {
       cwd: appRoot,
       env,
@@ -119,6 +167,9 @@ function startBackend(port) {
   });
   backendProcess.stderr.on("data", (chunk) => {
     console.error(`[backend] ${chunk.toString().trim()}`);
+  });
+  backendProcess.on("error", (error) => {
+    console.error(`[backend] failed to start: ${error.message}`);
   });
   backendProcess.on("exit", (code, signal) => {
     console.log(`[backend] exited code=${code} signal=${signal}`);
@@ -273,8 +324,8 @@ async function boot() {
   createMenu();
   const port = await findFreePort();
   backendUrl = `http://127.0.0.1:${port}`;
-  startBackend(port);
   try {
+    startBackend(port);
     await waitForBackend(backendUrl);
     createWindow();
   } catch (error) {
