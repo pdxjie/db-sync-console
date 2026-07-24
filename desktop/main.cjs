@@ -209,6 +209,7 @@ function createWindow() {
     height: 940,
     minWidth: 1180,
     minHeight: 760,
+    show: false,
     title: APP_NAME,
     backgroundColor: "#f4f6f8",
     icon: appIconPath(),
@@ -229,6 +230,11 @@ function createWindow() {
   } else {
     mainWindow.loadURL(backendUrl);
   }
+  mainWindow.once("ready-to-show", () => {
+    if (mainWindow) {
+      mainWindow.show();
+    }
+  });
   mainWindow.webContents.on("context-menu", (event, params) => {
     const template = [];
     if (params.isEditable) {
