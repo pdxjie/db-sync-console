@@ -23,12 +23,12 @@ class MySQLConfig:
     def from_dict(cls, raw: dict[str, Any] | None) -> "MySQLConfig":
         raw = raw or {}
         return cls(
-            host=str(raw.get("host", "")),
+            host=str(raw.get("host", "")).strip(),
             port=int(raw.get("port", 3306)),
-            user=str(raw.get("user", "")),
+            user=str(raw.get("user", "")).strip(),
             password=str(raw.get("password", "")),
-            database=str(raw.get("database", "")),
-            charset=str(raw.get("charset", "utf8mb4")),
+            database=str(raw.get("database", "")).strip(),
+            charset=str(raw.get("charset", "utf8mb4")).strip(),
             connect_timeout=int(raw.get("connect_timeout", 10)),
             read_timeout=int(raw.get("read_timeout", 120)),
             write_timeout=int(raw.get("write_timeout", 120)),
@@ -67,13 +67,13 @@ class AppConfig:
     data_dir: Path = Path("./data")
     log_dir: Path = Path("./logs")
     timezone: str = "Asia/Shanghai"
-    strict_schema: bool = True
+    strict_schema: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> "AppConfig":
         raw = raw or {}
-        data_dir = Path(str(raw.get("data_dir", "./data")))
-        log_dir = Path(str(raw.get("log_dir", "./logs")))
+        data_dir = Path(str(os.getenv("DB_SYNC_DATA_DIR") or raw.get("data_dir", "./data")))
+        log_dir = Path(str(os.getenv("DB_SYNC_LOG_DIR") or raw.get("log_dir", "./logs")))
         if not data_dir.is_absolute():
             data_dir = base_dir / data_dir
         if not log_dir.is_absolute():
@@ -83,7 +83,7 @@ class AppConfig:
             data_dir=data_dir,
             log_dir=log_dir,
             timezone=str(raw.get("timezone", "Asia/Shanghai")),
-            strict_schema=bool(raw.get("strict_schema", True)),
+            strict_schema=bool(raw.get("strict_schema", False)),
         )
 
 

@@ -6,6 +6,7 @@ from sync_tool.mysql import (
     build_upsert_sql,
     normalize_where_clause,
     quote_identifier,
+    sync_column_plan,
 )
 
 
@@ -34,6 +35,49 @@ class MySQLHelperTests(unittest.TestCase):
             "INSERT INTO `users` (`id`, `name`) VALUES (%s, %s) "
             "ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)",
         )
+
+    def test_sync_column_plan_uses_target_common_columns(self):
+        prod_columns = [
+            {"name": "id", "column_type": "bigint", "nullable": "NO", "column_default": None, "extra": ""},
+            {"name": "name", "column_type": "varchar(64)", "nullable": "YES", "column_default": None, "extra": ""},
+            {"name": "prod_only", "column_type": "int", "nullable": "YES", "column_default": None, "extra": ""},
+        ]
+        test_columns = [
+            {"name": "id", "column_type": "bigint", "nullable": "NO", "column_default": None, "extra": ""},
+            {"name": "test_only", "column_type": "varchar(16)", "nullable": "YES", "column_default": None, "extra": ""},
+            {"name": "name", "column_type": "varchar(128)", "nullable": "YES", "column_default": None, "extra": ""},
+        ]
+
+        plan = sync_column_plan(prod_columns, test_columns)
+
+        self.assertEqual(plan["write_columns"], ["id", "name"])
+        self.assertEqual(plan["source_only_columns"], ["prod_only"])
+        self.assertEqual(plan["target_only_columns"], ["test_only"])
+        self.assertEqual(plan["type_mismatches"][0]["name"], "name")
+
+    def test_sync_column_plan_warns_required_target_only_columns(self):
+        plan = sync_column_plan(
+            [{"name": "id", "column_type": "bigint", "nullable": "NO", "column_default": None, "extra": ""}],
+            [
+                {"name": "id", "column_type": "bigint", "nullable": "NO", "column_default": None, "extra": ""},
+                {
+                    "name": "tenant_id",
+                    "column_type": "bigint",
+                    "nullable": "NO",
+                    "column_default": None,
+                    "extra": "",
+                },
+                {
+                    "name": "created_at",
+                    "column_type": "datetime",
+                    "nullable": "NO",
+                    "column_default": "CURRENT_TIMESTAMP",
+                    "extra": "",
+                },
+            ],
+        )
+
+        self.assertEqual(plan["required_target_only_columns"], ["tenant_id"])
 
 
 if __name__ == "__main__":

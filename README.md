@@ -1,6 +1,6 @@
-# DB Sync Console
+# 同步犬 SyncDog
 
-本地数据库同步控制台，用来把产品环境数据库的指定表同步到测试环境。当前 provider 支持 MySQL，后续可以继续扩展 PostgreSQL、SQL Server 等数据库。第一版聚焦 `prod -> test`，支持表搜索勾选、`replace` / `upsert`、`where` 条件、同步计划、`dry-run`、分页、断点继续、日志、常用任务和 crontab 定时任务。
+本地数据库同步工作台，用来把产品环境数据库的指定表同步到测试环境。当前 provider 支持 MySQL，后续可以继续扩展 PostgreSQL、SQL Server 等数据库。第一版聚焦 `prod -> test`，支持表搜索勾选、`replace` / `upsert`、`where` 条件、同步计划、`dry-run`、分页、断点继续、日志、常用任务和 crontab 定时任务。
 
 ## 快速开始
 
@@ -27,6 +27,56 @@ data/sync_console.db
 
 页面不会回显密码；如果已经保存过密码，密码框留空再保存会沿用原密码。
 
+## Mac 桌面应用
+
+桌面版使用 Electron 启动 macOS 应用窗口，并自动拉起本地 FastAPI 后端作为同步引擎。桌面端使用独立 React/Ant Design renderer，不再直接嵌入浏览器版页面；后端使用随机本地端口，不会和 `8765` 的浏览器版抢端口。
+
+安装桌面依赖：
+
+```bash
+npm install
+```
+
+如果 Electron 默认下载源较慢，可以使用镜像：
+
+```bash
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
+```
+
+启动桌面版：
+
+```bash
+npm run desktop
+```
+
+打包 macOS 应用目录：
+
+```bash
+npm run desktop:pack
+```
+
+生成路径：
+
+```text
+release/mac/同步犬.app
+```
+
+打包 dmg：
+
+```bash
+npm run desktop:dist
+```
+
+当前桌面版仍依赖本机 Python 环境和 `.venv` 中的后端依赖。Apple Silicon 上会优先用 `arch -arm64` 启动 Python，避免 Electron x64 与 Python arm64 依赖架构不一致。
+
+如果打包时本机 `~/.npmrc` 权限异常，可以临时绕开：
+
+```bash
+NPM_CONFIG_USERCONFIG=/dev/null ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm run desktop:pack
+```
+
+当前 `.app` 未签名，首次打开可能需要在 macOS 安全设置里允许运行。后续产品化需要补应用图标和 Developer ID 签名。
+
 ## 可选高级配置
 
 默认不需要 `config.json`。如果想调整分页默认值、日志目录、结构校验或禁止同步的表，可以复制示例：
@@ -38,7 +88,7 @@ cp config.example.json config.json
 然后编辑：
 
 - `app.page_size`：每页同步行数
-- `app.strict_schema`：是否要求两边表结构一致
+- `app.strict_schema`：是否强制两边表结构完全一致，默认 `false`
 - `safety.blocked_tables`：禁止同步的表
 - `safety.max_rows_without_where`：无 `where` 时的大表提醒阈值
 
@@ -77,6 +127,27 @@ python -m sync_tool.cli --config config.json sync \
 
 ```bash
 python -m sync_tool.cli --config config.json resume <run_id>
+```
+
+## 表结构不一致
+
+默认会保留测试库已有表结构，不会因为产品库字段变化去修改测试库字段。
+
+- 产品库和测试库同名字段：参与同步
+- 产品库有、测试库没有的字段：跳过
+- 测试库有、产品库没有的字段：保留字段结构，不写入数据
+- 同名字段类型不一致：计划里提示 warning，执行时交给 MySQL 转换；如果目标字段无法接收数据，MySQL 会报错
+
+如果测试库额外字段是 `NOT NULL` 且没有默认值，新插入行可能失败。这种情况建议给测试库字段设置默认值，或者使用 `upsert` 同步已有行。
+
+如果想恢复旧行为，要求产品库和测试库字段完全一致，可以在 `config.json` 里设置：
+
+```json
+{
+  "app": {
+    "strict_schema": true
+  }
+}
 ```
 
 ## 同步模式

@@ -376,9 +376,9 @@ class SyncStore:
             )
         return self.get_run(payload["id"])
 
-    def update_run(self, run_id: str, **fields: Any) -> dict[str, Any]:
+    def update_run(self, run_id: str, *, fetch: bool = True, **fields: Any) -> dict[str, Any]:
         if not fields:
-            return self.get_run(run_id)
+            return self.get_run(run_id) if fetch else {}
         allowed = {
             "status",
             "total_rows",
@@ -398,7 +398,7 @@ class SyncStore:
         values.append(run_id)
         with self.connect() as conn:
             conn.execute(f"UPDATE runs SET {assignments} WHERE id = ?", values)
-        return self.get_run(run_id)
+        return self.get_run(run_id) if fetch else {}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -441,9 +441,9 @@ class SyncStore:
             )
         return self.get_run_table(payload["run_id"], payload["table_name"])
 
-    def update_run_table(self, run_id: str, table_name: str, **fields: Any) -> dict[str, Any]:
+    def update_run_table(self, run_id: str, table_name: str, *, fetch: bool = True, **fields: Any) -> dict[str, Any]:
         if not fields:
-            return self.get_run_table(run_id, table_name)
+            return self.get_run_table(run_id, table_name) if fetch else {}
         allowed = {
             "total_rows",
             "processed_rows",
@@ -467,7 +467,7 @@ class SyncStore:
                 f"UPDATE run_tables SET {assignments} WHERE run_id = ? AND table_name = ?",
                 values,
             )
-        return self.get_run_table(run_id, table_name)
+        return self.get_run_table(run_id, table_name) if fetch else {}
 
     def get_run_table(self, run_id: str, table_name: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -529,9 +529,17 @@ class SyncStore:
             )
         return self.get_run_shard(payload["run_id"], payload["table_name"], int(payload["shard_index"]))
 
-    def update_run_shard(self, run_id: str, table_name: str, shard_index: int, **fields: Any) -> dict[str, Any]:
+    def update_run_shard(
+        self,
+        run_id: str,
+        table_name: str,
+        shard_index: int,
+        *,
+        fetch: bool = True,
+        **fields: Any,
+    ) -> dict[str, Any]:
         if not fields:
-            return self.get_run_shard(run_id, table_name, shard_index)
+            return self.get_run_shard(run_id, table_name, shard_index) if fetch else {}
         allowed = {
             "start_pk",
             "end_pk",
@@ -562,7 +570,7 @@ class SyncStore:
                 """,
                 values,
             )
-        return self.get_run_shard(run_id, table_name, shard_index)
+        return self.get_run_shard(run_id, table_name, shard_index) if fetch else {}
 
     def get_run_shard(self, run_id: str, table_name: str, shard_index: int) -> dict[str, Any]:
         with self.connect() as conn:
@@ -691,12 +699,12 @@ class SyncStore:
         if (password is None or password == "") and existing.get("password"):
             password = existing["password"]
         return {
-            "host": str(payload.get("host") or existing.get("host") or ""),
+            "host": str(payload.get("host") or existing.get("host") or "").strip(),
             "port": int(payload.get("port") or existing.get("port") or 3306),
-            "user": str(payload.get("user") or existing.get("user") or ""),
+            "user": str(payload.get("user") or existing.get("user") or "").strip(),
             "password": str(password or ""),
-            "database": str(payload.get("database") or existing.get("database") or ""),
-            "charset": str(payload.get("charset") or existing.get("charset") or "utf8mb4"),
+            "database": str(payload.get("database") or existing.get("database") or "").strip(),
+            "charset": str(payload.get("charset") or existing.get("charset") or "utf8mb4").strip(),
             "connect_timeout": int(payload.get("connect_timeout") or existing.get("connect_timeout") or 10),
             "read_timeout": int(payload.get("read_timeout") or existing.get("read_timeout") or 120),
             "write_timeout": int(payload.get("write_timeout") or existing.get("write_timeout") or 120),

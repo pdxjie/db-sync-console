@@ -33,6 +33,14 @@ body {
   font-size: 14px;
 }
 
+body.desktop-app .topbar {
+  padding-top: 18px;
+}
+
+body.desktop-app .workspace {
+  padding-bottom: 24px;
+}
+
 button,
 input,
 select,
