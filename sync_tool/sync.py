@@ -30,13 +30,23 @@ class SyncPaused(RuntimeError):
     pass
 
 
+class SyncCancelled(RuntimeError):
+    pass
+
+
 class SyncEngine:
-    def __init__(self, config: Config | Callable[[], Config], store: SyncStore):
+    def __init__(
+        self,
+        config: Config | Callable[[], Config],
+        store: SyncStore,
+        event_callback: Callable[[str], None] | None = None,
+    ):
         if callable(config):
             self._config_provider = config
         else:
             self._config_provider = lambda: config
         self.store = store
+        self._event_callback = event_callback
 
     @property
     def config(self) -> Config:
@@ -403,6 +413,9 @@ class SyncEngine:
         if run["status"] == "success":
             self.log(run_id, "info", "Run already completed.")
             return
+        if run["status"] in {"canceled", "cancel_requested"} and not resume:
+            self._finalize_canceled_run(run_id)
+            return
         if run["status"] in {"paused", "pause_requested"} and not resume:
             self._finalize_paused_run(run_id)
             return
@@ -419,7 +432,7 @@ class SyncEngine:
                 current_table = table
                 if resume and table_state["status"] == "success":
                     continue
-                self._raise_if_pause_requested(run_id)
+                self._raise_if_stop_requested(run_id)
 
                 if table_state.get("cursor_field"):
                     self._execute_cursor_table(run, table_state, resume=resume)
@@ -439,6 +452,8 @@ class SyncEngine:
             self.log(run_id, "info", "Sync completed successfully.")
         except SyncPaused:
             self._finalize_paused_run(run_id, current_table)
+        except SyncCancelled:
+            self._finalize_canceled_run(run_id, current_table)
         except Exception as exc:
             message = str(exc)
             if current_table:
@@ -455,7 +470,7 @@ class SyncEngine:
         try:
             self.store.update_run(run_id, fetch=False, current_table=table)
             self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
-            self._raise_if_pause_requested(run_id, table)
+            self._raise_if_stop_requested(run_id, table)
             extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
             offset = int(table_state["offset_value"]) if resume else 0
             processed = int(table_state["processed_rows"]) if resume else 0
@@ -475,7 +490,7 @@ class SyncEngine:
             self.log(run_id, "warning", f"{table}: using offset pagination; large offsets can become slower over time.")
             count_is_estimated = bool(run.get("skip_exact_count"))
             while count_is_estimated or offset < total_rows:
-                self._raise_if_pause_requested(run_id, table)
+                self._raise_if_stop_requested(run_id, table)
                 rows = mysql.fetch_batch(
                     prod_conn,
                     table,
@@ -538,7 +553,7 @@ class SyncEngine:
         table = table_state["table_name"]
         self.store.update_run(run_id, fetch=False, current_table=table)
         self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
-        self._raise_if_pause_requested(run_id, table)
+        self._raise_if_stop_requested(run_id, table)
 
         prod_conn = mysql.connect(self.config.prod)
         test_conn = mysql.connect(self.config.test)
@@ -603,16 +618,16 @@ class SyncEngine:
                         write_primary_keys,
                     )
                 )
-            paused = False
+            control_error: SyncPaused | SyncCancelled | None = None
             for future in as_completed(futures):
                 try:
                     future.result()
-                except SyncPaused:
-                    paused = True
-            if paused:
+                except (SyncPaused, SyncCancelled) as exc:
+                    control_error = exc
+            if control_error:
                 self.store.aggregate_shards(run_id, table)
                 self._refresh_run_progress(run_id)
-                raise SyncPaused("Sync paused.")
+                raise control_error
 
         self.store.aggregate_shards(run_id, table)
         self._refresh_run_progress(run_id)
@@ -652,7 +667,7 @@ class SyncEngine:
                 f"{table} shard {shard_index}: range {shard.get('start_pk') or '-'}..{shard.get('end_pk') or '-'}, resume from {last_pk or '-'}.",
             )
             while True:
-                self._raise_if_pause_requested(run_id, table, shard_index)
+                self._raise_if_stop_requested(run_id, table, shard_index)
                 rows = mysql.fetch_keyset_batch(
                     prod_conn,
                     table,
@@ -710,7 +725,7 @@ class SyncEngine:
             self.store.aggregate_shards(run_id, table)
             self._refresh_run_progress(run_id)
             self.log(run_id, "info", f"{table} shard {shard_index}: {processed} row(s) synced, last_pk={last_pk}.")
-        except SyncPaused:
+        except (SyncPaused, SyncCancelled):
             raise
         except Exception as exc:
             test_conn.rollback()
@@ -721,16 +736,26 @@ class SyncEngine:
             test_conn.close()
 
     def _raise_if_pause_requested(self, run_id: str, table: str | None = None, shard_index: int | None = None) -> None:
+        self._raise_if_stop_requested(run_id, table, shard_index)
+
+    def _raise_if_stop_requested(self, run_id: str, table: str | None = None, shard_index: int | None = None) -> None:
         run = self.store.get_run(run_id)
-        if run["status"] != "pause_requested":
+        status = run["status"]
+        if status not in {"pause_requested", "cancel_requested"}:
             return
+        next_status = "paused" if status == "pause_requested" else "canceled"
         if table and shard_index is not None:
-            self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="paused", error=None)
+            self.store.update_run_shard(run_id, table, shard_index, fetch=False, status=next_status, error=None)
         elif table:
-            self.store.update_run_table(run_id, table, fetch=False, status="paused", error=None)
+            self.store.update_run_table(run_id, table, fetch=False, status=next_status, error=None)
+        if status == "cancel_requested":
+            raise SyncCancelled("Sync canceled.")
         raise SyncPaused("Sync paused.")
 
     def _finalize_paused_run(self, run_id: str, current_table: str | None = None) -> None:
+        if self.store.get_run(run_id)["status"] == "cancel_requested":
+            self._finalize_canceled_run(run_id, current_table)
+            return
         if current_table:
             try:
                 table_state = self.store.get_run_table(run_id, current_table)
@@ -759,6 +784,37 @@ class SyncEngine:
         )
         self.log(run_id, "info", "Sync paused. Resume will continue from the saved offset or last_pk.")
 
+    def _finalize_canceled_run(self, run_id: str, current_table: str | None = None) -> None:
+        for table_state in self.store.get_run_tables(run_id):
+            if table_state["status"] in {"pending", "running", "paused", "pause_requested", "cancel_requested"}:
+                self.store.update_run_table(
+                    run_id,
+                    table_state["table_name"],
+                    fetch=False,
+                    status="canceled",
+                    error=None,
+                )
+            for shard in self.store.get_run_shards(run_id, table_state["table_name"]):
+                if shard["status"] in {"pending", "running", "paused", "pause_requested", "cancel_requested"}:
+                    self.store.update_run_shard(
+                        run_id,
+                        table_state["table_name"],
+                        int(shard["shard_index"]),
+                        fetch=False,
+                        status="canceled",
+                        error=None,
+                    )
+        self._refresh_run_progress(run_id)
+        self.store.update_run(
+            run_id,
+            fetch=False,
+            status="canceled",
+            current_table=current_table,
+            error=None,
+            finished_at=utc_now(),
+        )
+        self.log(run_id, "info", "Sync canceled. This run cannot be resumed.")
+
     def log(self, run_id: str, level: str, message: str) -> None:
         self.store.append_log(run_id, level, message)
         log_dir = self.config.app.log_dir
@@ -766,6 +822,15 @@ class SyncEngine:
         log_file = log_dir / f"{run_id}.log"
         with log_file.open("a", encoding="utf-8") as handle:
             handle.write(f"{utc_now()} [{level.upper()}] {message}\n")
+        self.emit_run_event(run_id)
+
+    def emit_run_event(self, run_id: str) -> None:
+        if not self._event_callback:
+            return
+        try:
+            self._event_callback(run_id)
+        except Exception:
+            pass
 
     def _ensure_destination_table(self, prod_conn, test_conn, run: dict[str, Any], table: str) -> bool:
         if mysql.table_exists(test_conn, table):
@@ -869,6 +934,7 @@ class SyncEngine:
                     processed_bytes=0,
                 )
         self.store.update_run(run_id, fetch=False, status="success", finished_at=utc_now(), current_table=None)
+        self.emit_run_event(run_id)
 
     def _refresh_run_progress(self, run_id: str) -> None:
         tables = self.store.get_run_tables(run_id)
@@ -880,6 +946,7 @@ class SyncEngine:
             total_bytes=sum(int(table.get("total_bytes") or 0) for table in tables),
             processed_bytes=sum(int(table.get("processed_bytes") or 0) for table in tables),
         )
+        self.emit_run_event(run_id)
 
     def _extra_conditions(self, incremental_field: str, incremental_since: str) -> list[tuple[str, tuple[Any, ...]]]:
         if not incremental_field or not incremental_since:
@@ -1276,6 +1343,35 @@ class SyncManager:
             self.engine.log(run_id, "info", "Sync paused before execution started.")
         return self.get_run(run_id)
 
+    def cancel(self, run_id: str) -> dict[str, Any]:
+        run = self.engine.store.get_run(run_id)
+        if run["status"] == "canceled":
+            return self.get_run(run_id)
+        if run["status"] not in {"queued", "running", "pause_requested", "paused", "cancel_requested"}:
+            raise SyncPlanError(f"Run {run_id} cannot be canceled from status {run['status']}.")
+
+        next_status = "cancel_requested"
+        with self._lock:
+            if run["status"] == "paused" or (run["status"] == "queued" and run_id not in self._submitted):
+                next_status = "canceled"
+
+        if next_status == "canceled":
+            self.engine._finalize_canceled_run(run_id, run.get("current_table"))
+        else:
+            self.engine.store.update_run(
+                run_id,
+                fetch=False,
+                status=next_status,
+                error=None,
+                finished_at=None,
+            )
+            self.engine.log(
+                run_id,
+                "warning",
+                "Cancel requested. Sync will stop after the current batch is committed.",
+            )
+        return self.get_run(run_id)
+
     def start_job(self, job_id: int, *, source: str = "manual") -> dict[str, Any]:
         job = self.engine.store.get_job(job_id)
         payload = {
@@ -1327,7 +1423,7 @@ class SyncManager:
             try:
                 start = datetime.fromisoformat(started_at)
                 end = datetime.now(timezone.utc)
-                if run.get("status") in {"success", "failed", "paused"} and run.get("finished_at"):
+                if run.get("status") in {"success", "failed", "paused", "canceled"} and run.get("finished_at"):
                     end = datetime.fromisoformat(run["finished_at"])
                 elapsed_seconds = max(0.0, (end - start).total_seconds())
             except ValueError:

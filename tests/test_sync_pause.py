@@ -4,7 +4,7 @@ from pathlib import Path
 
 from sync_tool.config import AppConfig, Config, MySQLConfig, SafetyConfig
 from sync_tool.store import SyncStore
-from sync_tool.sync import SyncEngine, SyncManager, SyncPaused
+from sync_tool.sync import SyncCancelled, SyncEngine, SyncManager, SyncPaused
 
 
 def make_engine(tmp_path):
@@ -110,6 +110,112 @@ class SyncPauseTests(unittest.TestCase):
             table = store.aggregate_shards("run-1", "orders")
 
             self.assertEqual(table["status"], "paused")
+            self.assertEqual(table["processed_rows"], 7)
+
+    def test_cancel_request_marks_table_canceled_at_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="cancel_requested")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 5,
+                    "offset_value": 5,
+                    "status": "running",
+                }
+            )
+
+            with self.assertRaises(SyncCancelled):
+                engine._raise_if_stop_requested("run-1", "orders")
+
+            table = store.get_run_table("run-1", "orders")
+            self.assertEqual(table["status"], "canceled")
+            self.assertEqual(table["offset_value"], 5)
+
+    def test_manager_cancels_paused_run_without_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="paused")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 5,
+                    "offset_value": 5,
+                    "status": "paused",
+                }
+            )
+            manager = SyncManager(engine)
+            try:
+                run = manager.cancel("run-1")
+            finally:
+                manager.shutdown()
+
+            table = store.get_run_table("run-1", "orders")
+            self.assertEqual(run["status"], "canceled")
+            self.assertEqual(table["status"], "canceled")
+
+    def test_cancel_request_wins_over_pause_finalize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="cancel_requested")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 5,
+                    "offset_value": 5,
+                    "status": "running",
+                }
+            )
+
+            engine._finalize_paused_run("run-1", "orders")
+
+            run = store.get_run("run-1")
+            table = store.get_run_table("run-1", "orders")
+            self.assertEqual(run["status"], "canceled")
+            self.assertEqual(table["status"], "canceled")
+
+    def test_aggregate_shards_keeps_table_canceled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = make_engine(tmp)
+            create_run(store, status="cancel_requested")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 0,
+                    "cursor_field": "id",
+                    "status": "running",
+                }
+            )
+            store.create_run_shard(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "shard_index": 0,
+                    "processed_rows": 5,
+                    "status": "success",
+                }
+            )
+            store.create_run_shard(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "shard_index": 1,
+                    "processed_rows": 2,
+                    "status": "canceled",
+                }
+            )
+
+            table = store.aggregate_shards("run-1", "orders")
+
+            self.assertEqual(table["status"], "canceled")
             self.assertEqual(table["processed_rows"], 7)
 
 

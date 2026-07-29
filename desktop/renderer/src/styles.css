@@ -29,7 +29,8 @@ body {
 
 .app-header button,
 .app-header .ant-segmented,
-.app-header .ant-input {
+.app-header .ant-input,
+.app-header .help-tip-wrap {
   -webkit-app-region: no-drag;
 }
 
@@ -65,6 +66,20 @@ body {
   overflow: hidden;
 }
 
+.left-pane {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.left-pane > .ant-layout-sider-children {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .right-pane {
   border-right: 0;
   border-left: 1px solid #dbe3ec;
@@ -78,54 +93,190 @@ body {
 }
 
 .section-header {
-  min-height: 32px;
+  min-height: 30px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .pane-search {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .table-actions {
-  margin-bottom: 10px;
+  flex: 1;
+}
+
+.table-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.help-tip-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  cursor: help;
+}
+
+.help-tip {
+  color: #8a98aa;
+  font-size: 13px;
+  transition: color 0.15s ease;
+}
+
+.help-tip-wrap:hover .help-tip {
+  color: #2563eb;
+}
+
+.field-label,
+.checkbox-label,
+.tab-label,
+.action-with-help,
+.strategy-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.field-label,
+.checkbox-label,
+.tab-label {
+  white-space: nowrap;
+}
+
+.action-with-help {
+  vertical-align: middle;
+}
+
+.compact-help-action {
+  gap: 3px;
+}
+
+.strategy-control {
+  max-width: 100%;
 }
 
 .table-list-shell {
-  height: calc(100vh - 202px);
-  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
   border: 1px solid #dbe3ec;
   border-radius: 8px;
   background: #fff;
+}
+
+.table-list-shell .ant-table-wrapper,
+.table-list-shell .ant-spin-nested-loading,
+.table-list-shell .ant-spin-container,
+.table-list-shell .ant-table,
+.table-list-shell .ant-table-container {
+  height: 100%;
 }
 
 .table-list-shell .ant-table {
   border-radius: 8px;
 }
 
+.table-list-shell .ant-table-thead > tr > th {
+  padding: 8px 8px !important;
+  background: #f8fafc !important;
+  color: #667085;
+  font-size: 12px;
+}
+
+.table-list-shell .ant-table-tbody > tr > td {
+  padding: 7px 8px !important;
+}
+
+.table-list-shell .ant-table-cell {
+  white-space: nowrap;
+}
+
+.table-name-text {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-list-shell .ant-table-selection-column {
+  width: 28px !important;
+  min-width: 28px !important;
+  padding-inline: 4px !important;
+}
+
+.table-list-shell .ant-checkbox-wrapper {
+  line-height: 1;
+}
+
+.table-list-shell .ant-checkbox {
+  transform: scale(0.92);
+}
+
+.table-list-shell .ant-table-tbody > tr.ant-table-row-selected > td {
+  background: #eef6ff !important;
+}
+
+.left-pane-resizer {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  z-index: 20;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+}
+
+.left-pane-resizer::after {
+  position: absolute;
+  top: 12px;
+  right: 3px;
+  bottom: 12px;
+  width: 2px;
+  border-radius: 999px;
+  background: transparent;
+  content: "";
+  transition: background 0.15s ease;
+}
+
+.left-pane-resizer:hover::after,
+.is-resizing-left-pane .left-pane-resizer::after {
+  background: #4f8cff;
+}
+
+.is-resizing-left-pane {
+  cursor: col-resize;
+  user-select: none;
+}
+
 .toolbar-strip {
-  height: 48px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 2px 12px;
+  padding: 0 2px 10px;
 }
 
 .center-grid {
-  height: calc(100% - 48px);
+  height: calc(100% - 44px);
   display: grid;
-  grid-template-rows: minmax(390px, 0.95fr) minmax(160px, 1fr);
-  gap: 14px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
   overflow: hidden;
 }
 
 .panel {
   min-height: 0;
-  padding: 14px;
+  padding: 12px;
   border: 1px solid #dbe3ec;
   border-radius: 8px;
   background: #fff;
@@ -133,19 +284,53 @@ body {
 }
 
 .settings-panel {
-  overflow: auto;
+  overflow: hidden;
 }
 
 .sync-form-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
-  gap: 10px 12px;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 4px 8px;
+}
+
+.feature-hints {
+  margin: -2px 0 8px;
+  padding: 6px 8px;
+  border: 1px solid #e3e9f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .sync-form-grid .ant-form-item,
 .connection-form-grid .ant-form-item,
 .job-save-grid .ant-form-item {
-  margin-bottom: 8px;
+  margin-bottom: 4px;
+}
+
+.settings-panel .ant-form-item {
+  margin-bottom: 6px;
+}
+
+.settings-panel .ant-form-item-label {
+  padding-bottom: 2px;
+}
+
+.settings-panel .ant-form-item-label > label {
+  height: 18px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.settings-panel .ant-input,
+.settings-panel .ant-input-number,
+.settings-panel .ant-select-selector {
+  font-size: 13px;
+}
+
+.settings-panel textarea.ant-input {
+  min-height: 52px !important;
 }
 
 .sync-form-grid .ant-input-number,
@@ -199,6 +384,12 @@ body {
   width: 100%;
 }
 
+.run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -242,9 +433,24 @@ body {
 
 .job-save-grid {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
   gap: 8px;
-  align-items: end;
+  align-items: center;
+}
+
+.job-save-grid .ant-form-item {
+  margin-bottom: 0;
+}
+
+.job-save-grid .ant-form-item-control-input {
+  min-height: 32px;
+}
+
+.job-save-grid .ant-checkbox-wrapper {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  white-space: nowrap;
 }
 
 .clickable-row {
@@ -282,16 +488,44 @@ body {
   grid-column: span 2;
 }
 
+.docs-drawer .ant-drawer-body {
+  padding-top: 14px;
+}
+
+.docs-content {
+  display: grid;
+  gap: 12px;
+}
+
+.doc-section {
+  padding: 12px;
+  border: 1px solid #dbe3ec;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.doc-section h5.ant-typography {
+  margin: 0 0 8px;
+}
+
+.doc-section ol {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.doc-section li {
+  margin-bottom: 6px;
+  color: #344054;
+  line-height: 1.6;
+}
+
+.doc-section li:last-child {
+  margin-bottom: 0;
+}
+
 @media (max-width: 1180px) {
   .app-header {
     grid-template-columns: 76px minmax(0, 1fr) auto;
-  }
-
-  .left-pane {
-    flex: 0 0 300px !important;
-    max-width: 300px !important;
-    min-width: 300px !important;
-    width: 300px !important;
   }
 
   .right-pane {

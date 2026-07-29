@@ -212,6 +212,34 @@ class SyncStore:
             conn.execute(
                 """
                 UPDATE run_tables
+                SET status = 'canceled',
+                    error = NULL
+                WHERE run_id IN (SELECT id FROM runs WHERE status = 'cancel_requested')
+                  AND status IN ('running', 'pending', 'paused', 'pause_requested', 'cancel_requested')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE run_shards
+                SET status = 'canceled',
+                    error = NULL
+                WHERE run_id IN (SELECT id FROM runs WHERE status = 'cancel_requested')
+                  AND status IN ('running', 'pending', 'paused', 'pause_requested', 'cancel_requested')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = 'canceled',
+                    error = NULL,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE status = 'cancel_requested'
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                UPDATE run_tables
                 SET status = 'paused',
                     error = NULL
                 WHERE run_id IN (SELECT id FROM runs WHERE status = 'pause_requested')
@@ -648,6 +676,7 @@ class SyncStore:
                     MAX(last_pk) AS last_pk,
                     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
                     SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) AS paused_count,
+                    SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
                     COUNT(*) AS shard_count
                 FROM run_shards
@@ -658,11 +687,14 @@ class SyncStore:
         shard_count = int(row["shard_count"] or 0)
         success_count = int(row["success_count"] or 0)
         paused_count = int(row["paused_count"] or 0)
+        canceled_count = int(row["canceled_count"] or 0)
         failed_count = int(row["failed_count"] or 0)
         if shard_count and success_count == shard_count:
             status = "success"
         elif failed_count:
             status = "failed"
+        elif canceled_count:
+            status = "canceled"
         elif paused_count:
             status = "paused"
         else:

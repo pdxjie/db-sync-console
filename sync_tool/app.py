@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from pathlib import Path
+from threading import Condition
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -78,9 +81,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 CONFIG_PATH = Path(os.getenv("DB_SYNC_CONFIG") or os.getenv("MYSQL_SYNC_CONFIG") or PROJECT_ROOT / "config.json").expanduser().resolve()
 
+
+class RunEventBroker:
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._versions: dict[str, int] = {}
+
+    def publish(self, run_id: str) -> None:
+        with self._condition:
+            self._versions[run_id] = self._versions.get(run_id, 0) + 1
+            self._condition.notify_all()
+
+    def version(self, run_id: str) -> int:
+        with self._condition:
+            return self._versions.get(run_id, 0)
+
+    def wait_for_change(self, run_id: str, version: int, timeout: float) -> int:
+        with self._condition:
+            self._condition.wait_for(lambda: self._versions.get(run_id, 0) != version, timeout=timeout)
+            return self._versions.get(run_id, 0)
+
+
 base_config = load_config(CONFIG_PATH, require_exists=False)
 store = SyncStore(base_config.app.data_dir / "sync_console.db")
-engine = SyncEngine(lambda: effective_config(), store)
+event_broker = RunEventBroker()
+engine = SyncEngine(lambda: effective_config(), store, event_callback=event_broker.publish)
 manager = SyncManager(engine)
 scheduler = JobScheduler(base_config, store, manager)
 
@@ -200,6 +225,42 @@ def get_run(run_id: str, logs_limit: int = 120):
     return _call(lambda: manager.get_run(run_id, log_limit=max(0, min(int(logs_limit), 300))))
 
 
+@app.get("/api/runs/{run_id}/events")
+async def stream_run_events(request: Request, run_id: str, logs_limit: int = 80):
+    log_limit = max(0, min(int(logs_limit), 300))
+    initial = _call(lambda: manager.get_run(run_id, log_limit=log_limit))
+
+    def encode(payload: dict) -> str:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return f"event: run\ndata: {data}\n\n"
+
+    async def stream():
+        version = event_broker.version(run_id)
+        yield "retry: 2500\n\n"
+        yield encode(initial)
+        while True:
+            if await request.is_disconnected():
+                break
+            next_version = await asyncio.to_thread(event_broker.wait_for_change, run_id, version, 15.0)
+            if next_version == version:
+                yield ": keep-alive\n\n"
+                continue
+            version = next_version
+            try:
+                yield encode(manager.get_run(run_id, log_limit=log_limit))
+            except KeyError:
+                break
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/runs/{run_id}/resume")
 def resume_run(run_id: str):
     return _call(lambda: manager.resume(run_id))
@@ -208,6 +269,11 @@ def resume_run(run_id: str):
 @app.post("/api/runs/{run_id}/pause")
 def pause_run(run_id: str):
     return _call(lambda: manager.pause(run_id))
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str):
+    return _call(lambda: manager.cancel(run_id))
 
 
 @app.get("/api/runs/{run_id}/logs")

@@ -1,6 +1,6 @@
 {
   "name": "sync-dog",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "SyncDog desktop database sync app.",
   "main": "desktop/main.cjs",
   "private": true,
