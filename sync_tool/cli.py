@@ -100,8 +100,12 @@ def _add_sync_args(parser: argparse.ArgumentParser, *, dry_run_flag: bool) -> No
     parser.add_argument("--mode", choices=["replace", "upsert"], default="replace")
     parser.add_argument("--where", dest="where_clause", default="", help="Optional SQL condition without WHERE")
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--sync-strategy", choices=["offset", "cursor"], default="offset")
-    parser.add_argument("--cursor-field", default="", help="Cursor field for cursor strategy; defaults to first primary key")
+    parser.add_argument("--sync-strategy", choices=["auto", "offset", "cursor"], default="auto")
+    parser.add_argument(
+        "--cursor-field",
+        default="",
+        help="Cursor field(s) for keyset strategy, for example id or updated_at,id",
+    )
     parser.add_argument("--incremental-field", default="", help="Incremental column, for example updated_at")
     parser.add_argument("--incremental-since", default="", help="Incremental lower bound, for example 2026-07-01 00:00:00")
     parser.add_argument("--skip-exact-count", action="store_true", help="Use estimated row count instead of COUNT(*)")

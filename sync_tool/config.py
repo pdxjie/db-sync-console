@@ -63,7 +63,7 @@ class MySQLConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    page_size: int = 1000
+    page_size: int = 5000
     data_dir: Path = Path("./data")
     log_dir: Path = Path("./logs")
     timezone: str = "Asia/Shanghai"
@@ -79,7 +79,7 @@ class AppConfig:
         if not log_dir.is_absolute():
             log_dir = base_dir / log_dir
         return cls(
-            page_size=int(raw.get("page_size", 1000)),
+            page_size=int(raw.get("page_size", 5000)),
             data_dir=data_dir,
             log_dir=log_dir,
             timezone=str(raw.get("timezone", "Asia/Shanghai")),

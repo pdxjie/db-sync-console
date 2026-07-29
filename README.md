@@ -13,8 +13,10 @@
 - `replace` 覆盖写入和 `upsert` 插入或更新
 - 支持 `where` 条件和 `updated_at` 增量条件
 - 测试库字段优先：只同步两边共有字段，保留测试库独有字段
-- 大表模式：主键游标分页、`last_pk` 断点、跳过精确 count、分片并发
+- 智能分页：默认优先主键/非空唯一索引 keyset，避免 `OFFSET` 越跑越慢
+- 大表并发：`last_pk` 断点、跳过精确 count、数值游标分片并发
 - 运行进度：行数、速度、已同步 GB、预计剩余时间、分片状态
+- 暂停和继续：当前批次提交后暂停，继续时从 offset 或 `last_pk` 断点恢复
 - 常用同步任务保存和本地定时任务
 - 本地日志和历史运行记录
 
@@ -41,7 +43,7 @@ Apple Silicon Mac 可以直接下载：
 3. 填写产品库和测试库连接信息
 4. 点击“测试并登录”
 5. 在左侧搜索并勾选需要同步的表
-6. 选择同步模式、分页大小、where 条件或大表模式参数
+6. 选择同步模式、分页策略、分页大小、where 条件或大表参数
 7. 点击“生成计划”确认影响范围
 8. 需要演练时点击 `Dry-run`
 9. 确认后点击“开始同步”
@@ -89,9 +91,29 @@ Apple Silicon Mac 可以直接下载：
 }
 ```
 
-## 大表模式
+## 分页策略
 
-20GB 级别的大表不要使用 offset 分页，建议启用“大表模式”。大表模式会按游标字段推进：
+新版默认使用“智能同步”，普通同步也会优先使用 keyset 游标分页，不再默认使用 `LIMIT ... OFFSET ...`。
+
+选择顺序：
+
+- 产品表有主键：按主键游标同步
+- 没有主键，但有非空唯一索引：按唯一索引游标同步，支持组合唯一索引
+- 手动填写游标字段：支持 `id` 或 `updated_at,id`
+- 手动填写非唯一字段，例如 `updated_at`：如果表有主键，会自动补成 `updated_at,id` 这类稳定组合游标
+- 没有主键、没有非空唯一索引、也没有可用手动游标：自动回退到 `offset` 并在计划里提示
+
+强制 `offset` 只建议用于小表或临时排查。大表越同步到后面，`OFFSET` 越大，MySQL 需要扫描并丢弃的历史行越多，速度会逐渐下降。
+
+如果经常按 `updated_at,id` 同步，建议在产品库增加组合索引：
+
+```sql
+CREATE INDEX idx_table_updated_id ON table_name (updated_at, id);
+```
+
+## 大表并发
+
+20GB 级别的大表不要使用 offset 分页，建议使用“智能同步”或“大表并发”。keyset 会按游标字段推进：
 
 ```sql
 SELECT *
@@ -116,7 +138,7 @@ LIMIT 5000;
 注意：
 
 - 分片并发只适合数值型游标字段
-- 游标字段最好是主键或唯一递增索引
+- 游标字段最好是主键、非空唯一索引，或带主键 tie-breaker 的组合字段
 - `where` 条件和 `updated_at` 增量条件会同时生效
 - 页面显示的 GB 是按已拉取行内容估算，用于观察趋势
 
@@ -220,7 +242,7 @@ python -m sync_tool.cli --config config.json plan \
 python -m sync_tool.cli --config config.json sync \
   --tables users,orders \
   --mode upsert \
-  --batch-size 1000
+  --batch-size 5000
 ```
 
 dry-run：
@@ -248,7 +270,7 @@ cp config.example.json config.json
 
 常用配置：
 
-- `app.page_size`：默认分页大小
+- `app.page_size`：默认分页大小，当前默认 5000
 - `app.strict_schema`：是否要求两边表结构严格一致
 - `safety.blocked_tables`：禁止同步的表
 - `safety.max_rows_without_where`：无 where 时的大表提醒阈值

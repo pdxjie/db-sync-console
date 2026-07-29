@@ -4,9 +4,11 @@ from sync_tool.mysql import (
     SQLValidationError,
     build_insert_sql,
     build_upsert_sql,
+    cursor_seek_condition,
     normalize_where_clause,
     quote_identifier,
     sync_column_plan,
+    unique_index_for_columns,
 )
 
 
@@ -78,6 +80,33 @@ class MySQLHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["required_target_only_columns"], ["tenant_id"])
+
+    def test_unique_index_for_columns_requires_exact_column_order(self):
+        indexes = [
+            {"name": "uniq_email", "unique": True, "columns": ["email"]},
+            {"name": "idx_updated", "unique": False, "columns": ["updated_at", "id"]},
+        ]
+
+        self.assertEqual(unique_index_for_columns(indexes, ["email"])["name"], "uniq_email")
+        self.assertIsNone(unique_index_for_columns(indexes, ["id", "updated_at"]))
+
+    def test_cursor_seek_condition_supports_composite_cursor(self):
+        condition, params = cursor_seek_condition(["updated_at", "id"], ["2026-07-01 00:00:00", 100])
+
+        self.assertEqual(
+            condition,
+            "((`updated_at` > %s) OR (`updated_at` <=> %s AND `id` > %s))",
+        )
+        self.assertEqual(params, ("2026-07-01 00:00:00", "2026-07-01 00:00:00", 100))
+
+    def test_cursor_seek_condition_handles_null_values(self):
+        condition, params = cursor_seek_condition(["updated_at", "id"], [None, 100])
+
+        self.assertEqual(
+            condition,
+            "((`updated_at` IS NOT NULL) OR (`updated_at` <=> %s AND `id` > %s))",
+        )
+        self.assertEqual(params, (None, 100))
 
 
 if __name__ == "__main__":

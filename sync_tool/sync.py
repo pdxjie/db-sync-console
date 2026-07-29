@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from math import ceil
@@ -14,7 +15,7 @@ from .store import SyncStore, utc_now
 
 
 VALID_MODES = {"replace", "upsert"}
-VALID_STRATEGIES = {"offset", "cursor"}
+VALID_STRATEGIES = {"auto", "offset", "cursor"}
 MAX_WORKERS = 8
 MAX_SHARDS = 64
 RECOMMENDED_CURSOR_BATCH_SIZE = 5000
@@ -22,6 +23,10 @@ PROGRESS_AGGREGATE_INTERVAL_SECONDS = 1.5
 
 
 class SyncPlanError(RuntimeError):
+    pass
+
+
+class SyncPaused(RuntimeError):
     pass
 
 
@@ -56,7 +61,7 @@ class SyncEngine:
         where_clause: str = "",
         batch_size: int | None = None,
         create_missing_tables: bool = False,
-        sync_strategy: str = "offset",
+        sync_strategy: str = "auto",
         cursor_field: str = "",
         incremental_field: str = "",
         incremental_since: str = "",
@@ -109,6 +114,11 @@ class SyncEngine:
                     table_warnings.append("test table is missing; it will be created from product table structure")
 
                 prod_column_names = mysql.column_names(prod_columns)
+                nullable_source_columns = {
+                    str(column["name"])
+                    for column in prod_columns
+                    if str(column.get("nullable", "")).upper() == "YES"
+                }
                 target_primary_keys = []
                 if target_missing:
                     column_plan = {
@@ -147,6 +157,7 @@ class SyncEngine:
                         )
 
                 primary_keys = mysql.primary_key_columns(prod_conn, table)
+                source_indexes = mysql.list_indexes(prod_conn, table)
                 if target_missing:
                     target_primary_keys = primary_keys
                 write_primary_keys = target_primary_keys or primary_keys
@@ -163,9 +174,6 @@ class SyncEngine:
                         "test primary key differs from product primary key; upsert will use test primary key: "
                         + ", ".join(target_primary_keys)
                     )
-                if not primary_keys:
-                    table_warnings.append("table has no primary key; pagination order is not stable")
-
                 if incremental_field and incremental_field not in prod_column_names:
                     raise SyncPlanError(f"Incremental field {incremental_field} does not exist in {table}.")
                 extra_conditions = self._extra_conditions(incremental_field, incremental_since)
@@ -186,38 +194,47 @@ class SyncEngine:
                     )
 
                 resolved_cursor = ""
+                resolved_cursor_fields: list[str] = []
                 cursor_min = None
                 cursor_max = None
                 shards = []
                 effective_shard_count = 1
-                if sync_strategy == "cursor":
+                pagination = self._choose_pagination(
+                    table=table,
+                    requested_strategy=sync_strategy,
+                    cursor_field=cursor_field,
+                    prod_column_names=prod_column_names,
+                    nullable_source_columns=nullable_source_columns,
+                    primary_keys=primary_keys,
+                    indexes=source_indexes,
+                    row_count=row_count,
+                )
+                table_warnings.extend(pagination["warnings"])
+                effective_strategy = pagination["effective_strategy"]
+                if effective_strategy == "cursor":
                     if batch_size < RECOMMENDED_CURSOR_BATCH_SIZE:
                         table_warnings.append(
-                            f"batch size {batch_size} is small for big table mode; consider {RECOMMENDED_CURSOR_BATCH_SIZE}+"
+                            f"batch size {batch_size} is small for keyset pagination; consider {RECOMMENDED_CURSOR_BATCH_SIZE}+"
                         )
-                    resolved_cursor = cursor_field.strip() or (
-                        primary_keys[0]
-                        if primary_keys
-                        else target_primary_keys[0]
-                        if target_primary_keys and target_primary_keys[0] in prod_column_names
-                        else ""
-                    )
-                    if not resolved_cursor:
-                        raise SyncPlanError(f"Table {table} has no primary key; choose a cursor field for big table mode.")
-                    resolved_cursor = mysql.validate_identifier(resolved_cursor)
-                    if resolved_cursor not in prod_column_names:
-                        raise SyncPlanError(f"Cursor field {resolved_cursor} does not exist in {table}.")
-                    indexed_columns = mysql.indexed_columns(prod_conn, table)
-                    if resolved_cursor not in indexed_columns:
-                        table_warnings.append(f"cursor field {resolved_cursor} is not indexed; big table mode may be slow")
-                    if resolved_cursor not in primary_keys:
-                        table_warnings.append(
-                            f"cursor field {resolved_cursor} is not the primary key; make sure values are unique and stable"
+                    resolved_cursor_fields = pagination["cursor_fields"]
+                    resolved_cursor = self._format_cursor_fields(resolved_cursor_fields)
+                    if len(resolved_cursor_fields) == 1:
+                        cursor_range = mysql.min_max_cursor(
+                            prod_conn,
+                            table,
+                            resolved_cursor_fields[0],
+                            where_clause,
+                            extra_conditions,
                         )
-                    cursor_range = mysql.min_max_cursor(prod_conn, table, resolved_cursor, where_clause, extra_conditions)
-                    cursor_min = cursor_range["min"]
-                    cursor_max = cursor_range["max"]
-                    shards = self._build_shards(cursor_min, cursor_max, shard_count)
+                        cursor_min = cursor_range["min"]
+                        cursor_max = cursor_range["max"]
+                        shards = self._build_shards(cursor_min, cursor_max, shard_count)
+                    else:
+                        shards = [{"start": None, "end": None}]
+                        if shard_count > 1:
+                            table_warnings.append(
+                                "composite cursor uses one shard for correctness; numeric single-column cursors can use sharding"
+                            )
                     effective_shard_count = len(shards)
                     if shard_count > 1 and effective_shard_count == 1:
                         table_warnings.append("cursor range is not numeric or empty; using single cursor worker")
@@ -227,8 +244,10 @@ class SyncEngine:
                     action = "delete matching rows and insert"
                 if target_missing:
                     action = f"create test table, {action}"
-                if sync_strategy == "cursor":
-                    action = f"cursor {action}"
+                if effective_strategy == "cursor":
+                    action = f"keyset {action}"
+                elif sync_strategy == "auto":
+                    action = f"offset {action}"
 
                 plan_tables.append(
                     {
@@ -248,8 +267,13 @@ class SyncEngine:
                         "target_primary_keys": target_primary_keys,
                         "write_primary_keys": write_primary_keys,
                         "create_missing_table": target_missing,
-                        "sync_strategy": sync_strategy,
+                        "sync_strategy": effective_strategy,
+                        "requested_sync_strategy": sync_strategy,
+                        "pagination_strategy": effective_strategy,
                         "cursor_field": resolved_cursor,
+                        "cursor_fields": resolved_cursor_fields,
+                        "cursor_index": pagination.get("cursor_index"),
+                        "cursor_unique": pagination.get("cursor_unique", False),
                         "cursor_min": str(cursor_min) if cursor_min is not None else None,
                         "cursor_max": str(cursor_max) if cursor_max is not None else None,
                         "shard_count": effective_shard_count,
@@ -262,12 +286,21 @@ class SyncEngine:
             prod_conn.close()
             test_conn.close()
 
+        effective_strategies = {table["sync_strategy"] for table in plan_tables}
+        effective_sync_strategy = (
+            next(iter(effective_strategies))
+            if len(effective_strategies) == 1
+            else "mixed"
+            if effective_strategies
+            else sync_strategy
+        )
         return {
             "mode": mode,
             "where_clause": where_clause,
             "batch_size": batch_size,
             "create_missing_tables": create_missing_tables,
             "sync_strategy": sync_strategy,
+            "effective_sync_strategy": effective_sync_strategy,
             "cursor_field": cursor_field.strip(),
             "incremental_field": incremental_field,
             "incremental_since": incremental_since,
@@ -295,7 +328,7 @@ class SyncEngine:
             where_clause=payload.get("where_clause", ""),
             batch_size=payload.get("batch_size"),
             create_missing_tables=payload.get("create_missing_tables", False),
-            sync_strategy=payload.get("sync_strategy", "offset"),
+            sync_strategy=payload.get("sync_strategy", "auto"),
             cursor_field=payload.get("cursor_field", ""),
             incremental_field=payload.get("incremental_field", ""),
             incremental_since=payload.get("incremental_since", ""),
@@ -370,18 +403,15 @@ class SyncEngine:
         if run["status"] == "success":
             self.log(run_id, "info", "Run already completed.")
             return
+        if run["status"] in {"paused", "pause_requested"} and not resume:
+            self._finalize_paused_run(run_id)
+            return
         if run["dry_run"]:
             self._complete_dry_run(run_id)
             return
 
         self.store.update_run(run_id, fetch=False, status="running", started_at=run["started_at"] or utc_now(), error=None)
         self.log(run_id, "info", "Sync started.")
-        if run.get("sync_strategy") == "cursor":
-            self._execute_cursor_run(run_id, resume=resume)
-            return
-
-        prod_conn = mysql.connect(self.config.prod)
-        test_conn = mysql.connect(self.config.test)
         current_table = None
         try:
             for table_state in self.store.get_run_tables(run_id):
@@ -389,74 +419,12 @@ class SyncEngine:
                 current_table = table
                 if resume and table_state["status"] == "success":
                     continue
+                self._raise_if_pause_requested(run_id)
 
-                self.store.update_run(run_id, fetch=False, current_table=table)
-                self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
-                extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
-                offset = int(table_state["offset_value"]) if resume else 0
-                processed = int(table_state["processed_rows"]) if resume else 0
-                processed_bytes = int(table_state.get("processed_bytes") or 0) if resume else 0
-                total_rows = int(table_state["total_rows"])
-
-                target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
-                column_info = self._resolve_table_columns(prod_conn, test_conn, run, table)
-                fetch_columns = column_info["fetch_columns"]
-                write_columns = column_info["write_columns"]
-                order_columns = column_info["source_primary_keys"]
-                write_primary_keys = column_info["write_primary_keys"]
-
-                if offset == 0 and not target_created:
-                    self._prepare_destination_table(test_conn, run, table, extra_conditions)
-
-                while offset < total_rows:
-                    rows = mysql.fetch_batch(
-                        prod_conn,
-                        table,
-                        fetch_columns,
-                        run["where_clause"],
-                        order_columns,
-                        int(run["batch_size"]),
-                        offset,
-                        extra_conditions,
-                    )
-                    if not rows:
-                        break
-
-                    if run["mode"] == "replace":
-                        mysql.insert_rows(test_conn, table, write_columns, rows)
-                    elif run["mode"] == "upsert":
-                        mysql.upsert_rows(test_conn, table, write_columns, write_primary_keys, rows)
-                    else:
-                        raise SyncPlanError(f"Unsupported mode: {run['mode']}")
-
-                    test_conn.commit()
-                    batch_bytes = self._estimate_rows_bytes(rows, write_columns)
-                    offset += len(rows)
-                    processed += len(rows)
-                    processed_bytes += batch_bytes
-                    self.store.update_run_table(
-                        run_id,
-                        table,
-                        fetch=False,
-                        processed_rows=processed,
-                        processed_bytes=processed_bytes,
-                        offset_value=offset,
-                        status="running",
-                    )
-                    self._refresh_run_progress(run_id)
-                    self.log(run_id, "info", f"{table}: {processed}/{total_rows} rows synced.")
-
-                self.store.update_run_table(
-                    run_id,
-                    table,
-                    fetch=False,
-                    processed_rows=min(processed, total_rows),
-                    processed_bytes=processed_bytes,
-                    offset_value=min(offset, total_rows),
-                    status="success",
-                )
-                self._refresh_run_progress(run_id)
-                self.log(run_id, "info", f"{table}: completed.")
+                if table_state.get("cursor_field"):
+                    self._execute_cursor_table(run, table_state, resume=resume)
+                else:
+                    self._execute_offset_table(run, table_state, resume=resume)
 
             self.store.update_run(
                 run_id,
@@ -469,121 +437,189 @@ class SyncEngine:
                 error=None,
             )
             self.log(run_id, "info", "Sync completed successfully.")
+        except SyncPaused:
+            self._finalize_paused_run(run_id, current_table)
         except Exception as exc:
-            test_conn.rollback()
             message = str(exc)
             if current_table:
                 self.store.update_run_table(run_id, current_table, status="failed", error=message)
             self.store.update_run(run_id, status="failed", error=message, finished_at=utc_now())
             self.log(run_id, "error", message)
             raise
+
+    def _execute_offset_table(self, run: dict[str, Any], table_state: dict[str, Any], *, resume: bool = False) -> None:
+        run_id = run["id"]
+        table = table_state["table_name"]
+        prod_conn = mysql.connect(self.config.prod)
+        test_conn = mysql.connect(self.config.test)
+        try:
+            self.store.update_run(run_id, fetch=False, current_table=table)
+            self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
+            self._raise_if_pause_requested(run_id, table)
+            extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
+            offset = int(table_state["offset_value"]) if resume else 0
+            processed = int(table_state["processed_rows"]) if resume else 0
+            processed_bytes = int(table_state.get("processed_bytes") or 0) if resume else 0
+            total_rows = int(table_state["total_rows"])
+
+            target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
+            column_info = self._resolve_table_columns(prod_conn, test_conn, run, table)
+            fetch_columns = column_info["fetch_columns"]
+            write_columns = column_info["write_columns"]
+            order_columns = column_info["source_primary_keys"]
+            write_primary_keys = column_info["write_primary_keys"]
+
+            if offset == 0 and not target_created:
+                self._prepare_destination_table(test_conn, run, table, extra_conditions)
+
+            self.log(run_id, "warning", f"{table}: using offset pagination; large offsets can become slower over time.")
+            count_is_estimated = bool(run.get("skip_exact_count"))
+            while count_is_estimated or offset < total_rows:
+                self._raise_if_pause_requested(run_id, table)
+                rows = mysql.fetch_batch(
+                    prod_conn,
+                    table,
+                    fetch_columns,
+                    run["where_clause"],
+                    order_columns,
+                    int(run["batch_size"]),
+                    offset,
+                    extra_conditions,
+                )
+                if not rows:
+                    break
+
+                if run["mode"] == "replace":
+                    mysql.insert_rows(test_conn, table, write_columns, rows)
+                elif run["mode"] == "upsert":
+                    mysql.upsert_rows(test_conn, table, write_columns, write_primary_keys, rows)
+                else:
+                    raise SyncPlanError(f"Unsupported mode: {run['mode']}")
+
+                test_conn.commit()
+                batch_bytes = self._estimate_rows_bytes(rows, write_columns)
+                offset += len(rows)
+                processed += len(rows)
+                processed_bytes += batch_bytes
+                self.store.update_run_table(
+                    run_id,
+                    table,
+                    fetch=False,
+                    processed_rows=processed,
+                    processed_bytes=processed_bytes,
+                    offset_value=offset,
+                    status="running",
+                )
+                self._refresh_run_progress(run_id)
+                self.log(run_id, "info", f"{table}: {processed}/{total_rows} rows synced.")
+
+            final_total_rows = max(total_rows, processed) if count_is_estimated else total_rows
+            self.store.update_run_table(
+                run_id,
+                table,
+                fetch=False,
+                total_rows=final_total_rows,
+                processed_rows=min(processed, final_total_rows),
+                processed_bytes=processed_bytes,
+                offset_value=min(offset, final_total_rows),
+                status="success",
+            )
+            self._refresh_run_progress(run_id)
+            self.log(run_id, "info", f"{table}: completed.")
+        except Exception:
+            test_conn.rollback()
+            raise
         finally:
             prod_conn.close()
             test_conn.close()
 
-    def _execute_cursor_run(self, run_id: str, *, resume: bool = False) -> None:
-        run = self.store.get_run(run_id)
-        current_table = None
-        try:
-            for table_state in self.store.get_run_tables(run_id):
-                table = table_state["table_name"]
-                current_table = table
-                if resume and table_state["status"] == "success":
-                    continue
-                self.store.update_run(run_id, fetch=False, current_table=table)
-                self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
+    def _execute_cursor_table(self, run: dict[str, Any], table_state: dict[str, Any], *, resume: bool = False) -> None:
+        run_id = run["id"]
+        table = table_state["table_name"]
+        self.store.update_run(run_id, fetch=False, current_table=table)
+        self.store.update_run_table(run_id, table, fetch=False, status="running", error=None)
+        self._raise_if_pause_requested(run_id, table)
 
-                prod_conn = mysql.connect(self.config.prod)
-                test_conn = mysql.connect(self.config.test)
-                try:
-                    extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
-                    should_prepare = not resume or int(table_state.get("processed_rows") or 0) == 0
-                    target_created = False
-                    if should_prepare:
-                        target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
-                        if not target_created:
-                            self._prepare_destination_table(test_conn, run, table, extra_conditions)
-                    cursor_field = table_state.get("cursor_field") or run.get("cursor_field", "")
-                    column_info = self._resolve_table_columns(
-                        prod_conn,
-                        test_conn,
+        prod_conn = mysql.connect(self.config.prod)
+        test_conn = mysql.connect(self.config.test)
+        try:
+            extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
+            should_prepare = not resume or int(table_state.get("processed_rows") or 0) == 0
+            target_created = False
+            if should_prepare:
+                target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
+                if not target_created:
+                    self._prepare_destination_table(test_conn, run, table, extra_conditions)
+            cursor_field = table_state.get("cursor_field") or run.get("cursor_field", "")
+            column_info = self._resolve_table_columns(
+                prod_conn,
+                test_conn,
+                run,
+                table,
+                cursor_field=cursor_field,
+            )
+            fetch_columns = column_info["fetch_columns"]
+            write_columns = column_info["write_columns"]
+            write_primary_keys = column_info["write_primary_keys"]
+        finally:
+            prod_conn.close()
+            test_conn.close()
+
+        shards = self.store.get_run_shards(run_id, table)
+        if not shards:
+            shards = [
+                self.store.create_run_shard(
+                    {
+                        "run_id": run_id,
+                        "table_name": table,
+                        "shard_index": 0,
+                        "start_pk": None,
+                        "end_pk": None,
+                        "last_pk": table_state.get("last_pk"),
+                        "status": "pending",
+                    }
+                )
+            ]
+
+        worker_count = max(1, min(int(run.get("worker_count") or 1), len(shards), MAX_WORKERS))
+        self.log(
+            run_id,
+            "info",
+            f"{table}: keyset sync using {len(shards)} shard(s), {worker_count} worker(s), batch size {run['batch_size']}.",
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = []
+            for shard in shards:
+                if resume and shard["status"] == "success":
+                    continue
+                futures.append(
+                    executor.submit(
+                        self._execute_cursor_shard,
                         run,
                         table,
-                        cursor_field=cursor_field,
+                        shard,
+                        fetch_columns,
+                        write_columns,
+                        write_primary_keys,
                     )
-                    fetch_columns = column_info["fetch_columns"]
-                    write_columns = column_info["write_columns"]
-                    write_primary_keys = column_info["write_primary_keys"]
-                finally:
-                    prod_conn.close()
-                    test_conn.close()
-
-                shards = self.store.get_run_shards(run_id, table)
-                if not shards:
-                    shards = [
-                        self.store.create_run_shard(
-                            {
-                                "run_id": run_id,
-                                "table_name": table,
-                                "shard_index": 0,
-                                "start_pk": None,
-                                "end_pk": None,
-                                "last_pk": table_state.get("last_pk"),
-                                "status": "pending",
-                            }
-                        )
-                    ]
-
-                worker_count = max(1, min(int(run.get("worker_count") or 1), len(shards), MAX_WORKERS))
-                self.log(
-                    run_id,
-                    "info",
-                    f"{table}: cursor sync using {len(shards)} shard(s), {worker_count} worker(s), batch size {run['batch_size']}.",
                 )
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = []
-                    for shard in shards:
-                        if resume and shard["status"] == "success":
-                            continue
-                        futures.append(
-                            executor.submit(
-                                self._execute_cursor_shard,
-                                run,
-                                table,
-                                shard,
-                                fetch_columns,
-                                write_columns,
-                                write_primary_keys,
-                            )
-                        )
-                    for future in as_completed(futures):
-                        future.result()
-
+            paused = False
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except SyncPaused:
+                    paused = True
+            if paused:
                 self.store.aggregate_shards(run_id, table)
                 self._refresh_run_progress(run_id)
-                final_table = self.store.get_run_table(run_id, table)
-                if final_table["status"] != "success":
-                    self.store.update_run_table(run_id, table, status="success")
-                self.log(run_id, "info", f"{table}: cursor sync completed.")
+                raise SyncPaused("Sync paused.")
 
-            self.store.update_run(
-                run_id,
-                fetch=False,
-                status="success",
-                current_table=None,
-                processed_rows=self.store.sum_processed_rows(run_id),
-                processed_bytes=self.store.sum_processed_bytes(run_id),
-                finished_at=utc_now(),
-                error=None,
-            )
-            self.log(run_id, "info", "Sync completed successfully.")
-        except Exception as exc:
-            message = str(exc)
-            if current_table:
-                self.store.update_run_table(run_id, current_table, fetch=False, status="failed", error=message)
-            self.store.update_run(run_id, fetch=False, status="failed", error=message, finished_at=utc_now())
-            self.log(run_id, "error", message)
-            raise
+        self.store.aggregate_shards(run_id, table)
+        self._refresh_run_progress(run_id)
+        final_table = self.store.get_run_table(run_id, table)
+        if final_table["status"] != "success":
+            self.store.update_run_table(run_id, table, status="success")
+        self.log(run_id, "info", f"{table}: keyset sync completed.")
 
     def _execute_cursor_shard(
         self,
@@ -596,14 +632,16 @@ class SyncEngine:
     ) -> None:
         run_id = run["id"]
         shard_index = int(shard["shard_index"])
-        cursor_field = run.get("cursor_field") or self.store.get_run_table(run_id, table).get("cursor_field")
-        if not cursor_field:
+        cursor_field = self.store.get_run_table(run_id, table).get("cursor_field") or run.get("cursor_field", "")
+        cursor_fields = self._parse_cursor_fields(cursor_field)
+        if not cursor_fields:
             raise SyncPlanError(f"Cursor field is missing for {table}.")
         prod_conn = mysql.connect(self.config.prod)
         test_conn = mysql.connect(self.config.test)
         processed = int(shard.get("processed_rows") or 0)
         processed_bytes = int(shard.get("processed_bytes") or 0)
         last_pk = shard.get("last_pk")
+        last_values = self._decode_cursor_values(last_pk, len(cursor_fields))
         extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
         last_aggregate_at = monotonic()
         try:
@@ -614,14 +652,15 @@ class SyncEngine:
                 f"{table} shard {shard_index}: range {shard.get('start_pk') or '-'}..{shard.get('end_pk') or '-'}, resume from {last_pk or '-'}.",
             )
             while True:
-                rows = mysql.fetch_cursor_batch(
+                self._raise_if_pause_requested(run_id, table, shard_index)
+                rows = mysql.fetch_keyset_batch(
                     prod_conn,
                     table,
                     fetch_columns,
                     run["where_clause"],
-                    cursor_field,
+                    cursor_fields,
                     int(run["batch_size"]),
-                    last_pk=last_pk,
+                    last_values=last_values,
                     shard_start=shard.get("start_pk"),
                     shard_end=shard.get("end_pk"),
                     extra_conditions=extra_conditions,
@@ -640,7 +679,8 @@ class SyncEngine:
                 batch_bytes = self._estimate_rows_bytes(rows, write_columns)
                 processed += len(rows)
                 processed_bytes += batch_bytes
-                last_pk = rows[-1][cursor_field]
+                last_values = [rows[-1][field] for field in cursor_fields]
+                last_pk = self._encode_cursor_values(last_values)
                 self.store.update_run_shard(
                     run_id,
                     table,
@@ -670,6 +710,8 @@ class SyncEngine:
             self.store.aggregate_shards(run_id, table)
             self._refresh_run_progress(run_id)
             self.log(run_id, "info", f"{table} shard {shard_index}: {processed} row(s) synced, last_pk={last_pk}.")
+        except SyncPaused:
+            raise
         except Exception as exc:
             test_conn.rollback()
             self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="failed", error=str(exc))
@@ -677,6 +719,45 @@ class SyncEngine:
         finally:
             prod_conn.close()
             test_conn.close()
+
+    def _raise_if_pause_requested(self, run_id: str, table: str | None = None, shard_index: int | None = None) -> None:
+        run = self.store.get_run(run_id)
+        if run["status"] != "pause_requested":
+            return
+        if table and shard_index is not None:
+            self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="paused", error=None)
+        elif table:
+            self.store.update_run_table(run_id, table, fetch=False, status="paused", error=None)
+        raise SyncPaused("Sync paused.")
+
+    def _finalize_paused_run(self, run_id: str, current_table: str | None = None) -> None:
+        if current_table:
+            try:
+                table_state = self.store.get_run_table(run_id, current_table)
+            except KeyError:
+                table_state = None
+            if table_state and table_state["status"] in {"pending", "running", "pause_requested"}:
+                self.store.update_run_table(run_id, current_table, fetch=False, status="paused", error=None)
+            for shard in self.store.get_run_shards(run_id, current_table):
+                if shard["status"] in {"pending", "running", "pause_requested"}:
+                    self.store.update_run_shard(
+                        run_id,
+                        current_table,
+                        int(shard["shard_index"]),
+                        fetch=False,
+                        status="paused",
+                        error=None,
+                    )
+        self._refresh_run_progress(run_id)
+        self.store.update_run(
+            run_id,
+            fetch=False,
+            status="paused",
+            current_table=current_table,
+            error=None,
+            finished_at=utc_now(),
+        )
+        self.log(run_id, "info", "Sync paused. Resume will continue from the saved offset or last_pk.")
 
     def log(self, run_id: str, level: str, message: str) -> None:
         self.store.append_log(run_id, level, message)
@@ -730,10 +811,12 @@ class SyncEngine:
                 )
 
         fetch_columns = list(write_columns)
-        if cursor_field and cursor_field not in fetch_columns:
-            if cursor_field not in mysql.column_names(prod_columns):
-                raise SyncPlanError(f"Cursor field {cursor_field} does not exist in {table}.")
-            fetch_columns.append(cursor_field)
+        prod_column_names = mysql.column_names(prod_columns)
+        for field in self._parse_cursor_fields(cursor_field):
+            if field not in fetch_columns:
+                if field not in prod_column_names:
+                    raise SyncPlanError(f"Cursor field {field} does not exist in {table}.")
+                fetch_columns.append(field)
 
         return {
             "fetch_columns": fetch_columns,
@@ -788,11 +871,14 @@ class SyncEngine:
         self.store.update_run(run_id, fetch=False, status="success", finished_at=utc_now(), current_table=None)
 
     def _refresh_run_progress(self, run_id: str) -> None:
+        tables = self.store.get_run_tables(run_id)
         self.store.update_run(
             run_id,
             fetch=False,
-            processed_rows=self.store.sum_processed_rows(run_id),
-            processed_bytes=self.store.sum_processed_bytes(run_id),
+            total_rows=sum(int(table.get("total_rows") or 0) for table in tables),
+            processed_rows=sum(int(table.get("processed_rows") or 0) for table in tables),
+            total_bytes=sum(int(table.get("total_bytes") or 0) for table in tables),
+            processed_bytes=sum(int(table.get("processed_bytes") or 0) for table in tables),
         )
 
     def _extra_conditions(self, incremental_field: str, incremental_since: str) -> list[tuple[str, tuple[Any, ...]]]:
@@ -800,6 +886,252 @@ class SyncEngine:
             return []
         condition = mysql.incremental_condition(incremental_field, incremental_since)
         return [condition] if condition else []
+
+    def _choose_pagination(
+        self,
+        *,
+        table: str,
+        requested_strategy: str,
+        cursor_field: str,
+        prod_column_names: list[str],
+        nullable_source_columns: set[str],
+        primary_keys: list[str],
+        indexes: list[dict[str, Any]],
+        row_count: int,
+    ) -> dict[str, Any]:
+        warnings: list[str] = []
+        manual_fields = self._parse_cursor_fields(cursor_field)
+        if requested_strategy == "offset":
+            if row_count > self.config.safety.max_rows_without_where:
+                warnings.append(
+                    "forced offset pagination may become slower as OFFSET grows; use auto or keyset pagination when possible"
+                )
+            return {
+                "effective_strategy": "offset",
+                "cursor_fields": [],
+                "cursor_index": None,
+                "cursor_unique": False,
+                "warnings": warnings,
+            }
+
+        if manual_fields:
+            missing = [field for field in manual_fields if field not in prod_column_names]
+            if missing:
+                raise SyncPlanError(f"Cursor field(s) do not exist in {table}: {', '.join(missing)}")
+
+            selected_fields = list(manual_fields)
+            if not self._cursor_tuple_is_unique(selected_fields, primary_keys, indexes, nullable_source_columns):
+                unique_prefix = self._unique_index_with_prefix(indexes, selected_fields, prod_column_names, nullable_source_columns)
+                if unique_prefix:
+                    selected_fields = list(unique_prefix["columns"])
+                    warnings.append(
+                        "cursor field(s) expanded to unique index "
+                        f"{unique_prefix['name']}: {self._format_cursor_fields(selected_fields)}"
+                    )
+                elif primary_keys:
+                    appended = [field for field in primary_keys if field not in selected_fields]
+                    selected_fields.extend(appended)
+                    warnings.append(
+                        "primary key appended to cursor for stable keyset pagination: "
+                        + self._format_cursor_fields(selected_fields)
+                    )
+                else:
+                    unique_tie_breaker = self._best_unique_index(indexes, prod_column_names, nullable_source_columns)
+                    if unique_tie_breaker:
+                        appended = [field for field in unique_tie_breaker["columns"] if field not in selected_fields]
+                        selected_fields.extend(appended)
+                        warnings.append(
+                            "unique key appended to cursor for stable keyset pagination: "
+                            + self._format_cursor_fields(selected_fields)
+                        )
+
+            cursor_unique = self._cursor_tuple_is_unique(
+                selected_fields,
+                primary_keys,
+                indexes,
+                nullable_source_columns,
+            )
+            matching_index = mysql.unique_index_for_columns(indexes, selected_fields) or self._index_with_prefix(
+                indexes,
+                selected_fields,
+            )
+            if not matching_index:
+                prefix_index = self._index_with_prefix(indexes, manual_fields)
+                if prefix_index:
+                    warnings.append(
+                        "cursor uses index prefix "
+                        f"{prefix_index['name']}; add a composite index on "
+                        f"({self._format_cursor_fields(selected_fields)}) for best speed"
+                    )
+                else:
+                    warnings.append(
+                        f"cursor field(s) {self._format_cursor_fields(selected_fields)} are not backed by a matching index; keyset pagination may be slow"
+                    )
+            if self._has_nullable_cursor_fields(selected_fields, nullable_source_columns):
+                warnings.append(
+                    f"cursor field(s) {self._format_cursor_fields(selected_fields)} include nullable columns; non-null indexed cursors are faster and easier to resume"
+                )
+            if not cursor_unique:
+                warnings.append(
+                    f"cursor field(s) {self._format_cursor_fields(selected_fields)} are not unique; duplicate values can cause skipped rows"
+                )
+            return {
+                "effective_strategy": "cursor",
+                "cursor_fields": selected_fields,
+                "cursor_index": (matching_index or {}).get("name"),
+                "cursor_unique": cursor_unique,
+                "warnings": warnings,
+            }
+
+        if primary_keys:
+            return {
+                "effective_strategy": "cursor",
+                "cursor_fields": primary_keys,
+                "cursor_index": "PRIMARY",
+                "cursor_unique": True,
+                "warnings": warnings,
+            }
+
+        selected = self._best_unique_index(indexes, prod_column_names, nullable_source_columns)
+        if selected:
+            warnings.append(
+                f"table has no primary key; using unique index {selected['name']} for keyset pagination"
+            )
+            return {
+                "effective_strategy": "cursor",
+                "cursor_fields": list(selected["columns"]),
+                "cursor_index": selected["name"],
+                "cursor_unique": True,
+                "warnings": warnings,
+            }
+
+        if requested_strategy == "cursor":
+            raise SyncPlanError(
+                f"Table {table} has no primary key or non-null unique index; choose a stable unique cursor field for keyset pagination."
+            )
+
+        nullable_unique_indexes = [
+            index
+            for index in indexes
+            if index.get("unique")
+            and index.get("columns")
+            and all(column in prod_column_names for column in index["columns"])
+            and self._has_nullable_cursor_fields(list(index["columns"]), nullable_source_columns)
+        ]
+        if nullable_unique_indexes:
+            warnings.append(
+                "only nullable unique indexes are available; auto mode avoids them because MySQL allows duplicate NULL values"
+            )
+        warnings.append(
+            "table has no primary key or unique index; falling back to offset pagination, which can slow down on large tables"
+        )
+        return {
+            "effective_strategy": "offset",
+            "cursor_fields": [],
+            "cursor_index": None,
+            "cursor_unique": False,
+            "warnings": warnings,
+        }
+
+    def _best_unique_index(
+        self,
+        indexes: list[dict[str, Any]],
+        prod_column_names: list[str],
+        nullable_source_columns: set[str],
+    ) -> dict[str, Any] | None:
+        candidates = [
+            index
+            for index in indexes
+            if index.get("unique")
+            and index.get("columns")
+            and all(column in prod_column_names for column in index["columns"])
+            and not self._has_nullable_cursor_fields(list(index["columns"]), nullable_source_columns)
+        ]
+        candidates.sort(key=lambda item: (len(item["columns"]), 0 if item.get("primary") else 1, item["name"]))
+        return candidates[0] if candidates else None
+
+    def _unique_index_with_prefix(
+        self,
+        indexes: list[dict[str, Any]],
+        fields: list[str],
+        prod_column_names: list[str],
+        nullable_source_columns: set[str],
+    ) -> dict[str, Any] | None:
+        for index in indexes:
+            columns = list(index.get("columns") or [])
+            if (
+                index.get("unique")
+                and columns[: len(fields)] == fields
+                and all(column in prod_column_names for column in columns)
+                and not self._has_nullable_cursor_fields(columns, nullable_source_columns)
+            ):
+                return index
+        return None
+
+    def _cursor_tuple_is_unique(
+        self,
+        fields: list[str],
+        primary_keys: list[str],
+        indexes: list[dict[str, Any]],
+        nullable_source_columns: set[str],
+    ) -> bool:
+        field_set = set(fields)
+        if primary_keys and set(primary_keys).issubset(field_set):
+            return True
+        for index in indexes:
+            columns = list(index.get("columns") or [])
+            if (
+                index.get("unique")
+                and columns
+                and set(columns).issubset(field_set)
+                and not self._has_nullable_cursor_fields(columns, nullable_source_columns)
+            ):
+                return True
+        return False
+
+    def _has_nullable_cursor_fields(self, fields: list[str], nullable_source_columns: set[str]) -> bool:
+        return any(field in nullable_source_columns for field in fields)
+
+    def _parse_cursor_fields(self, cursor_field: str | None) -> list[str]:
+        fields = []
+        for raw in str(cursor_field or "").replace("，", ",").split(","):
+            field = raw.strip()
+            if field:
+                fields.append(mysql.validate_identifier(field))
+        if len(fields) != len(set(fields)):
+            raise SyncPlanError("Cursor fields must not contain duplicates.")
+        return fields
+
+    def _format_cursor_fields(self, fields: list[str]) -> str:
+        return ",".join(fields)
+
+    def _index_with_prefix(self, indexes: list[dict[str, Any]], fields: list[str]) -> dict[str, Any] | None:
+        for index in indexes:
+            columns = list(index.get("columns") or [])
+            if columns[: len(fields)] == fields:
+                return index
+        return None
+
+    def _encode_cursor_values(self, values: list[Any]) -> Any:
+        if len(values) == 1:
+            return None if values[0] is None else str(values[0])
+        return json.dumps([None if value is None else str(value) for value in values], ensure_ascii=False)
+
+    def _decode_cursor_values(self, raw: Any, field_count: int) -> list[Any] | None:
+        if raw is None or raw == "":
+            return None
+        if field_count == 1:
+            return [raw]
+        if isinstance(raw, str):
+            try:
+                values = json.loads(raw)
+            except json.JSONDecodeError:
+                values = [item.strip() for item in raw.split(",")]
+        else:
+            values = list(raw)
+        if len(values) != field_count:
+            return None
+        return values
 
     def _has_filter(self, where_clause: str | None, incremental_field: str, incremental_since: str) -> bool:
         return bool(mysql.normalize_where_clause(where_clause) or (incremental_field and incremental_since))
@@ -868,7 +1200,7 @@ class SyncEngine:
         return mode
 
     def _validate_strategy(self, strategy: str) -> str:
-        strategy = str(strategy or "offset").strip().lower()
+        strategy = str(strategy or "auto").strip().lower()
         if strategy not in VALID_STRATEGIES:
             raise SyncPlanError(
                 f"Unsupported sync strategy: {strategy}. Expected one of: {', '.join(sorted(VALID_STRATEGIES))}"
@@ -908,11 +1240,40 @@ class SyncManager:
 
     def resume(self, run_id: str) -> dict[str, Any]:
         run = self.engine.store.get_run(run_id)
-        if run["status"] not in {"failed", "queued"}:
+        if run["status"] not in {"failed", "queued", "paused"}:
             raise SyncPlanError(f"Run {run_id} cannot be resumed from status {run['status']}.")
+        with self._lock:
+            if run_id in self._submitted:
+                raise SyncPlanError(f"Run {run_id} is still active. Wait for pause to finish before resuming.")
         self.engine.store.update_run(run_id, status="queued", error=None, finished_at=None)
         self.engine.log(run_id, "info", "Run queued for resume.")
         self._submit(run_id, resume=True)
+        return self.get_run(run_id)
+
+    def pause(self, run_id: str) -> dict[str, Any]:
+        run = self.engine.store.get_run(run_id)
+        if run["status"] == "paused":
+            return self.get_run(run_id)
+        if run["status"] not in {"queued", "running", "pause_requested"}:
+            raise SyncPlanError(f"Run {run_id} cannot be paused from status {run['status']}.")
+        next_status = "pause_requested"
+        with self._lock:
+            if run["status"] == "queued" and run_id not in self._submitted:
+                next_status = "paused"
+        self.engine.store.update_run(
+            run_id,
+            fetch=False,
+            status=next_status,
+            error=None,
+            finished_at=utc_now() if next_status == "paused" else None,
+        )
+        self.engine.log(
+            run_id,
+            "info",
+            "Pause requested. Sync will stop after the current batch is committed.",
+        )
+        if next_status == "paused":
+            self.engine.log(run_id, "info", "Sync paused before execution started.")
         return self.get_run(run_id)
 
     def start_job(self, job_id: int, *, source: str = "manual") -> dict[str, Any]:
@@ -923,7 +1284,7 @@ class SyncManager:
             "where_clause": job["where_clause"],
             "batch_size": job["batch_size"],
             "create_missing_tables": job["create_missing_tables"],
-            "sync_strategy": job.get("sync_strategy", "offset"),
+            "sync_strategy": job.get("sync_strategy", "auto"),
             "cursor_field": job.get("cursor_field", ""),
             "incremental_field": job.get("incremental_field", ""),
             "incremental_since": job.get("incremental_since", ""),
@@ -935,7 +1296,7 @@ class SyncManager:
         }
         return self.start(payload, job_id=job_id, name=f"{job['name']} ({source})")
 
-    def get_run(self, run_id: str) -> dict[str, Any]:
+    def get_run(self, run_id: str, *, log_limit: int = 120) -> dict[str, Any]:
         run = self.engine.store.get_run(run_id)
         metrics = self._run_metrics(run)
         return {
@@ -943,7 +1304,7 @@ class SyncManager:
             **metrics,
             "tables_state": self.engine.store.get_run_tables(run_id),
             "shards_state": self.engine.store.get_run_shards(run_id),
-            "logs": self.engine.store.get_logs(run_id),
+            "logs": self.engine.store.get_logs(run_id, log_limit),
         }
 
     def shutdown(self, wait: bool = False) -> None:
@@ -965,7 +1326,10 @@ class SyncManager:
         if started_at:
             try:
                 start = datetime.fromisoformat(started_at)
-                elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - start).total_seconds())
+                end = datetime.now(timezone.utc)
+                if run.get("status") in {"success", "failed", "paused"} and run.get("finished_at"):
+                    end = datetime.fromisoformat(run["finished_at"])
+                elapsed_seconds = max(0.0, (end - start).total_seconds())
             except ValueError:
                 elapsed_seconds = 0.0
         processed_rows = int(run.get("processed_rows") or 0)

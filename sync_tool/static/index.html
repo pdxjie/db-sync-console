@@ -134,7 +134,7 @@
             </label>
             <label>
               <span>分页大小</span>
-              <input id="batchSize" class="control" type="number" min="1" value="1000" />
+              <input id="batchSize" class="control" type="number" min="1" value="5000" />
             </label>
             <label class="checkbox-line">
               <input id="dryRun" type="checkbox" />
@@ -150,13 +150,14 @@
             <label>
               <span>同步方式</span>
               <select id="syncStrategy" class="control">
-                <option value="offset">普通分页</option>
-                <option value="cursor">大表游标</option>
+                <option value="auto">智能同步</option>
+                <option value="offset">强制 offset</option>
+                <option value="cursor">大表并发</option>
               </select>
             </label>
             <label>
               <span>游标字段</span>
-              <input id="cursorField" class="control" placeholder="默认主键" />
+              <input id="cursorField" class="control" placeholder="留空自动选择，支持 updated_at,id" />
             </label>
             <label>
               <span>增量字段</span>
@@ -207,10 +208,11 @@
               <thead>
                 <tr>
                   <th>表</th>
-              <th>动作</th>
-              <th>行数</th>
-              <th>分片</th>
-              <th>主键</th>
+                  <th>动作</th>
+                  <th>读取</th>
+                  <th>行数</th>
+                  <th>分片</th>
+                  <th>游标</th>
             </tr>
               </thead>
               <tbody id="planBody"></tbody>
@@ -224,7 +226,10 @@
               <h2>当前运行</h2>
               <span id="runStatus" class="muted">无</span>
             </div>
-            <button id="resumeBtn" class="secondary hidden">继续</button>
+            <div class="action-row">
+              <button id="pauseBtn" class="secondary hidden">暂停</button>
+              <button id="resumeBtn" class="secondary hidden">继续</button>
+            </div>
           </div>
           <div id="runMetrics" class="metric-grid"></div>
           <div class="progress-shell">
