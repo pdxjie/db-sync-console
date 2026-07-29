@@ -9,3 +9,5 @@ config.json
 release/
 dist/
 assets/*.iconset/
+build/
+desktop/backend-dist/

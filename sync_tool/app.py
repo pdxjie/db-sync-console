@@ -23,7 +23,7 @@ class SyncPayload(BaseModel):
     where_clause: str = ""
     batch_size: int | None = None
     create_missing_tables: bool = False
-    sync_strategy: Literal["offset", "cursor"] = "offset"
+    sync_strategy: Literal["auto", "offset", "cursor"] = "auto"
     cursor_field: str = ""
     incremental_field: str = ""
     incremental_since: str = ""
@@ -41,7 +41,7 @@ class JobPayload(BaseModel):
     where_clause: str = ""
     batch_size: int | None = None
     create_missing_tables: bool = False
-    sync_strategy: Literal["offset", "cursor"] = "offset"
+    sync_strategy: Literal["auto", "offset", "cursor"] = "auto"
     cursor_field: str = ""
     incremental_field: str = ""
     incremental_since: str = ""
@@ -196,13 +196,18 @@ def list_runs(limit: int = 30):
 
 
 @app.get("/api/runs/{run_id}")
-def get_run(run_id: str):
-    return _call(lambda: manager.get_run(run_id))
+def get_run(run_id: str, logs_limit: int = 120):
+    return _call(lambda: manager.get_run(run_id, log_limit=max(0, min(int(logs_limit), 300))))
 
 
 @app.post("/api/runs/{run_id}/resume")
 def resume_run(run_id: str):
     return _call(lambda: manager.resume(run_id))
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: str):
+    return _call(lambda: manager.pause(run_id))
 
 
 @app.get("/api/runs/{run_id}/logs")

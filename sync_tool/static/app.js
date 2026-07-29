@@ -7,6 +7,9 @@ const state = {
   desktop: Boolean(window.dbSyncDesktop?.isDesktop),
 };
 
+const ACTIVE_RUN_STATUSES = new Set(["queued", "running", "pause_requested"]);
+const RESUMABLE_RUN_STATUSES = new Set(["failed", "paused"]);
+
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -63,6 +66,7 @@ const els = {
   runHistory: $("runHistory"),
   runStatus: $("runStatus"),
   runMetrics: $("runMetrics"),
+  pauseBtn: $("pauseBtn"),
   resumeBtn: $("resumeBtn"),
   progressBar: $("progressBar"),
   runTables: $("runTables"),
@@ -108,6 +112,24 @@ function formatDuration(seconds) {
   if (hours > 0) return `${hours}h ${minutes}m`;
   if (minutes > 0) return `${minutes}m ${secs}s`;
   return `${secs}s`;
+}
+
+function syncStrategyLabel(strategy, cursorField = "", workerCount = 1) {
+  if (strategy === "cursor") return `大表并发 ${cursorField || "自动游标"} | ${workerCount || 1} 并发`;
+  if (strategy === "offset") return "强制 offset";
+  return `智能同步${cursorField ? ` | ${cursorField}` : ""}`;
+}
+
+function runStatusLabel(status) {
+  const labels = {
+    queued: "排队中",
+    running: "同步中",
+    pause_requested: "暂停中",
+    paused: "已暂停",
+    success: "已完成",
+    failed: "失败",
+  };
+  return labels[status] || status || "-";
 }
 
 function filteredTables() {
@@ -336,9 +358,10 @@ function renderPlan(plan) {
     row.innerHTML = `
       <td>${escapeHtml(table.name)}</td>
       <td>${escapeHtml(table.action)}</td>
+      <td>${escapeHtml(table.pagination_strategy === "cursor" ? "keyset" : table.pagination_strategy || "-")}</td>
       <td>${formatNumber(table.row_count)}${table.estimated ? " 估算" : ""}</td>
       <td>${formatNumber(table.shard_count || 1)}</td>
-      <td>${escapeHtml((table.primary_keys || []).join(", ") || "-")}</td>
+      <td>${escapeHtml(table.cursor_field || (table.primary_keys || []).join(", ") || "-")}</td>
     `;
     els.planBody.append(row);
   }
@@ -427,7 +450,7 @@ function renderJobs(jobs) {
         <span class="muted">${escapeHtml(job.mode)}</span>
       </div>
       <div class="muted">${escapeHtml(job.tables.join(", "))}</div>
-      <div class="muted">${job.sync_strategy === "cursor" ? `大表游标 ${escapeHtml(job.cursor_field || "默认主键")} | ${job.worker_count || 1} 并发` : "普通分页"}</div>
+      <div class="muted">${escapeHtml(syncStrategyLabel(job.sync_strategy, job.cursor_field, job.worker_count))}</div>
       <div class="muted">${job.create_missing_tables ? "缺表自动建表" : "缺表时报错"}</div>
       <div class="muted">${job.schedule_enabled ? `cron ${escapeHtml(job.cron_expr)}` : "手动"}</div>
       <div class="job-actions">
@@ -447,9 +470,9 @@ function loadJobIntoForm(job) {
   state.selected = new Set(job.tables);
   els.mode.value = job.mode;
   els.whereClause.value = job.where_clause || "";
-  els.batchSize.value = job.batch_size || 1000;
+  els.batchSize.value = job.batch_size || 5000;
   els.createMissingTables.checked = Boolean(job.create_missing_tables);
-  els.syncStrategy.value = job.sync_strategy || "offset";
+  els.syncStrategy.value = job.sync_strategy || "auto";
   els.cursorField.value = job.cursor_field || "";
   els.incrementalField.value = job.incremental_field || "";
   els.incrementalSince.value = job.incremental_since || "";
@@ -502,7 +525,7 @@ function renderRunHistory(runs) {
     item.innerHTML = `
       <div class="history-line">
         <strong>${escapeHtml(run.name)}</strong>
-        <span>${escapeHtml(run.status)}</span>
+        <span>${escapeHtml(runStatusLabel(run.status))}</span>
       </div>
       <div class="muted">${escapeHtml(run.created_at)}</div>
     `;
@@ -514,9 +537,9 @@ function renderRunHistory(runs) {
 async function openRun(runId) {
   try {
     state.currentRunId = runId;
-    const run = await api(`/api/runs/${runId}`);
+    const run = await api(`/api/runs/${runId}?logs_limit=120`);
     renderRun(run);
-    if (["queued", "running"].includes(run.status)) pollRun();
+    if (ACTIVE_RUN_STATUSES.has(run.status)) pollRun();
   } catch (error) {
     showToast(error.message);
   }
@@ -526,10 +549,10 @@ async function pollRun() {
   window.clearTimeout(state.pollTimer);
   if (!state.currentRunId) return;
   try {
-    const run = await api(`/api/runs/${state.currentRunId}`);
+    const run = await api(`/api/runs/${state.currentRunId}?logs_limit=80`);
     renderRun(run);
-    if (["queued", "running"].includes(run.status)) {
-      state.pollTimer = window.setTimeout(pollRun, 1200);
+    if (ACTIVE_RUN_STATUSES.has(run.status)) {
+      state.pollTimer = window.setTimeout(pollRun, run.status === "pause_requested" ? 700 : 1400);
     } else {
       await loadRuns();
     }
@@ -540,10 +563,14 @@ async function pollRun() {
 
 function renderRun(run) {
   const percent = run.total_rows > 0 ? Math.round((run.processed_rows / run.total_rows) * 100) : run.status === "success" ? 100 : 0;
-  els.runStatus.textContent = `${run.status} | ${formatNumber(run.processed_rows)}/${formatNumber(run.total_rows)} | ${percent}%`;
+  els.runStatus.textContent = `${runStatusLabel(run.status)} | ${formatNumber(run.processed_rows)}/${formatNumber(run.total_rows)} | ${percent}%`;
   renderRunMetrics(run);
   els.progressBar.style.width = `${Math.min(100, percent)}%`;
-  els.resumeBtn.classList.toggle("hidden", run.status !== "failed");
+  els.pauseBtn.classList.toggle("hidden", !ACTIVE_RUN_STATUSES.has(run.status));
+  els.pauseBtn.disabled = run.status === "pause_requested";
+  els.pauseBtn.textContent = run.status === "pause_requested" ? "暂停中" : "暂停";
+  els.pauseBtn.onclick = () => pauseRun(run.id);
+  els.resumeBtn.classList.toggle("hidden", !RESUMABLE_RUN_STATUSES.has(run.status));
   els.resumeBtn.onclick = () => resumeRun(run.id);
 
   els.runTables.innerHTML = "";
@@ -554,7 +581,7 @@ function renderRun(run) {
     item.innerHTML = `
       <div class="run-table-line">
         <strong>${escapeHtml(table.table_name)}</strong>
-        <span>${escapeHtml(table.status)} ${tablePercent}%</span>
+        <span>${escapeHtml(runStatusLabel(table.status))} ${tablePercent}%</span>
       </div>
       <div class="muted">${formatNumber(table.processed_rows)} / ${formatNumber(table.total_rows)} rows, ${table.cursor_field ? `last_pk ${escapeHtml(table.last_pk || "-")}` : `offset ${formatNumber(table.offset_value)}`}</div>
       ${table.error ? `<div class="error-text">${escapeHtml(table.error)}</div>` : ""}
@@ -591,6 +618,17 @@ async function resumeRun(runId) {
   }
 }
 
+async function pauseRun(runId) {
+  try {
+    const run = await api(`/api/runs/${runId}/pause`, { method: "POST" });
+    renderRun(run);
+    pollRun();
+    showToast("已请求暂停，当前批次完成后会停住");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 function setBusy(isBusy) {
   els.saveConnectionsBtn.disabled = isBusy;
   els.loginConnectionsBtn.disabled = isBusy;
@@ -599,6 +637,7 @@ function setBusy(isBusy) {
   els.planBtn.disabled = isBusy;
   els.startBtn.disabled = isBusy;
   els.saveJobBtn.disabled = isBusy;
+  els.pauseBtn.disabled = isBusy;
 }
 
 function escapeHtml(value) {

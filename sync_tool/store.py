@@ -46,7 +46,7 @@ class SyncStore:
                     where_clause TEXT NOT NULL DEFAULT '',
                     batch_size INTEGER NOT NULL,
                     create_missing_tables INTEGER NOT NULL DEFAULT 0,
-                    sync_strategy TEXT NOT NULL DEFAULT 'offset',
+                    sync_strategy TEXT NOT NULL DEFAULT 'auto',
                     cursor_field TEXT NOT NULL DEFAULT '',
                     incremental_field TEXT NOT NULL DEFAULT '',
                     incremental_since TEXT NOT NULL DEFAULT '',
@@ -68,7 +68,7 @@ class SyncStore:
                     where_clause TEXT NOT NULL DEFAULT '',
                     batch_size INTEGER NOT NULL,
                     create_missing_tables INTEGER NOT NULL DEFAULT 0,
-                    sync_strategy TEXT NOT NULL DEFAULT 'offset',
+                    sync_strategy TEXT NOT NULL DEFAULT 'auto',
                     cursor_field TEXT NOT NULL DEFAULT '',
                     incremental_field TEXT NOT NULL DEFAULT '',
                     incremental_since TEXT NOT NULL DEFAULT '',
@@ -141,7 +141,7 @@ class SyncStore:
             )
             for table in ("jobs", "runs"):
                 self._ensure_column(conn, table, "create_missing_tables", "INTEGER NOT NULL DEFAULT 0")
-                self._ensure_column(conn, table, "sync_strategy", "TEXT NOT NULL DEFAULT 'offset'")
+                self._ensure_column(conn, table, "sync_strategy", "TEXT NOT NULL DEFAULT 'auto'")
                 self._ensure_column(conn, table, "cursor_field", "TEXT NOT NULL DEFAULT ''")
                 self._ensure_column(conn, table, "incremental_field", "TEXT NOT NULL DEFAULT ''")
                 self._ensure_column(conn, table, "incremental_since", "TEXT NOT NULL DEFAULT ''")
@@ -211,6 +211,34 @@ class SyncStore:
         with self.connect() as conn:
             conn.execute(
                 """
+                UPDATE run_tables
+                SET status = 'paused',
+                    error = NULL
+                WHERE run_id IN (SELECT id FROM runs WHERE status = 'pause_requested')
+                  AND status IN ('running', 'pending', 'pause_requested')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE run_shards
+                SET status = 'paused',
+                    error = NULL
+                WHERE run_id IN (SELECT id FROM runs WHERE status = 'pause_requested')
+                  AND status IN ('running', 'pending', 'pause_requested')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = 'paused',
+                    error = NULL,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE status = 'pause_requested'
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
                 UPDATE runs
                 SET status = 'failed',
                     error = 'Process stopped while this run was active.',
@@ -257,7 +285,7 @@ class SyncStore:
                     payload.get("where_clause", ""),
                     int(payload["batch_size"]),
                     1 if payload.get("create_missing_tables") else 0,
-                    payload.get("sync_strategy", "offset"),
+                    payload.get("sync_strategy", "auto"),
                     payload.get("cursor_field", ""),
                     payload.get("incremental_field", ""),
                     payload.get("incremental_since", ""),
@@ -306,7 +334,7 @@ class SyncStore:
                     merged.get("where_clause", ""),
                     int(merged["batch_size"]),
                     1 if merged.get("create_missing_tables") else 0,
-                    merged.get("sync_strategy", "offset"),
+                    merged.get("sync_strategy", "auto"),
                     merged.get("cursor_field", ""),
                     merged.get("incremental_field", ""),
                     merged.get("incremental_since", ""),
@@ -358,7 +386,7 @@ class SyncStore:
                     payload.get("where_clause", ""),
                     int(payload["batch_size"]),
                     1 if payload.get("create_missing_tables") else 0,
-                    payload.get("sync_strategy", "offset"),
+                    payload.get("sync_strategy", "auto"),
                     payload.get("cursor_field", ""),
                     payload.get("incremental_field", ""),
                     payload.get("incremental_since", ""),
@@ -619,13 +647,26 @@ class SyncStore:
                     COALESCE(SUM(processed_bytes), 0) AS processed_bytes,
                     MAX(last_pk) AS last_pk,
                     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+                    SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) AS paused_count,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
                     COUNT(*) AS shard_count
                 FROM run_shards
                 WHERE run_id = ? AND table_name = ?
                 """,
                 (run_id, table_name),
             ).fetchone()
-        status = "success" if int(row["shard_count"] or 0) and row["success_count"] == row["shard_count"] else "running"
+        shard_count = int(row["shard_count"] or 0)
+        success_count = int(row["success_count"] or 0)
+        paused_count = int(row["paused_count"] or 0)
+        failed_count = int(row["failed_count"] or 0)
+        if shard_count and success_count == shard_count:
+            status = "success"
+        elif failed_count:
+            status = "failed"
+        elif paused_count:
+            status = "paused"
+        else:
+            status = "running"
         return self.update_run_table(
             run_id,
             table_name,

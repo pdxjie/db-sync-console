@@ -35,6 +35,7 @@ import {
   DatabaseOutlined,
   FieldTimeOutlined,
   FolderOpenOutlined,
+  PauseCircleOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -49,11 +50,13 @@ const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
 const APP_NAME = "同步犬";
 const BIG_TABLE_BATCH_SIZE = 5000;
+const RUN_ACTIVE_STATUSES = new Set(["queued", "running", "pause_requested"]);
+const RUN_RESUMABLE_STATUSES = new Set(["failed", "paused"]);
 const DEFAULT_SYNC_VALUES = {
   mode: "replace",
-  batch_size: 1000,
+  batch_size: 5000,
   create_missing_tables: false,
-  sync_strategy: "offset",
+  sync_strategy: "auto",
   cursor_field: "",
   incremental_field: "",
   incremental_since: "",
@@ -95,6 +98,24 @@ function formatDuration(seconds) {
   if (hours) return `${hours}h ${minutes}m`;
   if (minutes) return `${minutes}m ${secs}s`;
   return `${secs}s`;
+}
+
+function syncStrategyLabel(strategy, cursorField = "", workerCount = 1) {
+  if (strategy === "cursor") return `大表并发 ${cursorField || "自动游标"} · ${workerCount || 1} 并发`;
+  if (strategy === "offset") return "强制 offset";
+  return `智能同步${cursorField ? ` · ${cursorField}` : ""}`;
+}
+
+function runStatusLabel(status) {
+  const labels = {
+    queued: "排队中",
+    running: "同步中",
+    pause_requested: "暂停中",
+    paused: "已暂停",
+    success: "已完成",
+    failed: "失败",
+  };
+  return labels[status] || status || "-";
 }
 
 function blankConnection() {
@@ -182,18 +203,18 @@ function AppShell() {
   }, [connectionReady]);
 
   useEffect(() => {
-    if (!currentRun || !["queued", "running"].includes(currentRun.status)) return;
+    if (!currentRun || !RUN_ACTIVE_STATUSES.has(currentRun.status)) return;
     const timer = setTimeout(async () => {
       try {
-        const run = await api(`/api/runs/${currentRun.id}`);
+        const run = await api(`/api/runs/${currentRun.id}?logs_limit=80`);
         setCurrentRun(run);
-        if (!["queued", "running"].includes(run.status)) {
+        if (!RUN_ACTIVE_STATUSES.has(run.status)) {
           refreshRuns();
         }
       } catch (error) {
         message.error(error.message);
       }
-    }, 1200);
+    }, currentRun.status === "pause_requested" ? 700 : 1400);
     return () => clearTimeout(timer);
   }, [currentRun]);
 
@@ -202,7 +223,7 @@ function AppShell() {
     const currentBatchSize = Number(syncForm.getFieldValue("batch_size") || 0);
     syncForm.setFieldsValue({
       sync_strategy: value,
-      ...(value === "cursor" && currentBatchSize <= DEFAULT_SYNC_VALUES.batch_size
+      ...(value !== "offset" && currentBatchSize <= DEFAULT_SYNC_VALUES.batch_size
         ? { batch_size: BIG_TABLE_BATCH_SIZE }
         : {}),
     });
@@ -327,7 +348,7 @@ function AppShell() {
 
   async function openRun(run) {
     try {
-      const detail = await api(`/api/runs/${run.id}`);
+      const detail = await api(`/api/runs/${run.id}?logs_limit=120`);
       setCurrentRun(detail);
     } catch (error) {
       message.error(error.message);
@@ -340,6 +361,17 @@ function AppShell() {
       const run = await api(`/api/runs/${currentRun.id}/resume`, { method: "POST" });
       setCurrentRun(run);
       message.success("已继续");
+    } catch (error) {
+      message.error(error.message);
+    }
+  }
+
+  async function pauseRun() {
+    if (!currentRun) return;
+    try {
+      const run = await api(`/api/runs/${currentRun.id}/pause`, { method: "POST" });
+      setCurrentRun(run);
+      message.success("已请求暂停，当前批次完成后会停住");
     } catch (error) {
       message.error(error.message);
     }
@@ -434,10 +466,16 @@ function AppShell() {
             <Table
               size="small"
               rowKey="name"
-              pagination={false}
+              pagination={{
+                pageSize: 80,
+                showSizeChanger: false,
+                simple: true,
+                hideOnSinglePage: true,
+              }}
               dataSource={filteredTables}
               rowSelection={{
                 selectedRowKeys: selectedTables,
+                preserveSelectedRowKeys: true,
                 onChange: (keys) => setSelectedTables(keys),
               }}
               columns={[
@@ -465,8 +503,9 @@ function AppShell() {
             <Segmented
               value={syncStrategy}
               options={[
-                { label: "普通同步", value: "offset" },
-                { label: "大表模式", value: "cursor" },
+                { label: "智能同步", value: "auto" },
+                { label: "强制 offset", value: "offset" },
+                { label: "大表并发", value: "cursor" },
               ]}
               onChange={changeSyncStrategy}
             />
@@ -507,7 +546,7 @@ function AppShell() {
                     <InputNumber min={1} />
                   </Form.Item>
                   <Form.Item label="游标字段" name="cursor_field">
-                    <Input placeholder={syncStrategy === "cursor" ? "默认主键" : "大表模式使用"} disabled={syncStrategy !== "cursor"} />
+                    <Input placeholder={syncStrategy === "offset" ? "强制 offset 时不使用" : "留空自动选择，支持 updated_at,id"} disabled={syncStrategy === "offset"} />
                   </Form.Item>
                   <Form.Item label="增量字段" name="incremental_field">
                     <Input placeholder="updated_at" />
@@ -516,10 +555,10 @@ function AppShell() {
                     <Input placeholder="2026-07-01 00:00:00" />
                   </Form.Item>
                   <Form.Item label="分片数" name="shard_count">
-                    <InputNumber min={1} max={64} disabled={syncStrategy !== "cursor"} />
+                    <InputNumber min={1} max={64} disabled={syncStrategy === "offset"} />
                   </Form.Item>
                   <Form.Item label="并发数" name="worker_count">
-                    <InputNumber min={1} max={8} disabled={syncStrategy !== "cursor"} />
+                    <InputNumber min={1} max={8} disabled={syncStrategy === "offset"} />
                   </Form.Item>
                   <Form.Item label=" " name="create_missing_tables" valuePropName="checked">
                     <Checkbox>缺表自动建表</Checkbox>
@@ -551,6 +590,12 @@ function AppShell() {
                     { title: "表", dataIndex: "name", ellipsis: true },
                     { title: "动作", dataIndex: "action", ellipsis: true },
                     {
+                      title: "读取",
+                      dataIndex: "pagination_strategy",
+                      width: 88,
+                      render: (value) => (value === "cursor" ? "keyset" : value || "-"),
+                    },
+                    {
                       title: "行数",
                       dataIndex: "row_count",
                       width: 110,
@@ -564,7 +609,7 @@ function AppShell() {
                       align: "right",
                       render: (value, row) => `${value?.length || 0}/${row.source_columns?.length || value?.length || 0}`,
                     },
-                    { title: "游标", dataIndex: "cursor_field", width: 90, render: (value) => value || "-" },
+                    { title: "游标", dataIndex: "cursor_field", width: 120, render: (value) => value || "-" },
                     { title: "分片", dataIndex: "shard_count", width: 70, align: "right" },
                   ]}
                   locale={{ emptyText: <Empty description="生成计划后查看" /> }}
@@ -586,6 +631,7 @@ function AppShell() {
                     run={currentRun}
                     percent={runPercent}
                     onResume={resumeRun}
+                    onPause={pauseRun}
                   />
                 ),
               },
@@ -639,11 +685,20 @@ function SectionHeader({ icon, title, extra }) {
   );
 }
 
-function RunPanel({ run, percent, onResume }) {
+function RunPanel({ run, percent, onResume, onPause }) {
   if (!run) {
     return <Empty className="pane-empty" description="尚无运行" />;
   }
-  const statusColor = run.status === "success" ? "success" : run.status === "failed" ? "error" : "processing";
+  const statusColor =
+    run.status === "success"
+      ? "success"
+      : run.status === "failed"
+        ? "error"
+        : run.status === "paused"
+          ? "warning"
+          : "processing";
+  const canPause = RUN_ACTIVE_STATUSES.has(run.status);
+  const canResume = RUN_RESUMABLE_STATUSES.has(run.status);
   const shards = run.shards_state || [];
   return (
     <div className="run-panel">
@@ -651,7 +706,8 @@ function RunPanel({ run, percent, onResume }) {
         <Space className="run-title" align="center">
           <Badge status={statusColor} />
           <Text strong>{run.name}</Text>
-          <Tag>{run.sync_strategy || "offset"}</Tag>
+          <Tag>{runStatusLabel(run.status)}</Tag>
+          <Tag>{syncStrategyLabel(run.sync_strategy, run.cursor_field, run.worker_count)}</Tag>
         </Space>
         <Progress percent={percent} status={run.status === "failed" ? "exception" : undefined} />
         <div className="metric-grid">
@@ -660,11 +716,23 @@ function RunPanel({ run, percent, onResume }) {
           <Statistic title="剩余" value={formatDuration(run.eta_seconds)} />
           <Statistic title="耗时" value={formatDuration(run.elapsed_seconds || 0)} />
         </div>
-        {run.status === "failed" ? (
-          <Button danger onClick={onResume}>
-            继续
-          </Button>
-        ) : null}
+        <Space.Compact block>
+          {canPause ? (
+            <Button
+              icon={<PauseCircleOutlined />}
+              onClick={onPause}
+              loading={run.status === "pause_requested"}
+              disabled={run.status === "pause_requested"}
+            >
+              {run.status === "pause_requested" ? "暂停中" : "暂停"}
+            </Button>
+          ) : null}
+          {canResume ? (
+            <Button type={run.status === "paused" ? "primary" : "default"} danger={run.status === "failed"} onClick={onResume}>
+              继续
+            </Button>
+          ) : null}
+        </Space.Compact>
         <List
           size="small"
           dataSource={run.tables_state || []}
@@ -674,7 +742,7 @@ function RunPanel({ run, percent, onResume }) {
                 title={
                   <Space>
                     <Text>{table.table_name}</Text>
-                    <Tag>{table.status}</Tag>
+                    <Tag>{runStatusLabel(table.status)}</Tag>
                   </Space>
                 }
                 description={`${formatNumber(table.processed_rows)} / ${formatNumber(table.total_rows)} 行 · ${
@@ -696,7 +764,7 @@ function RunPanel({ run, percent, onResume }) {
                     title={
                       <Space>
                         <Text>#{shard.shard_index}</Text>
-                        <Tag>{shard.status}</Tag>
+                        <Tag>{runStatusLabel(shard.status)}</Tag>
                       </Space>
                     }
                     description={`${formatNumber(shard.processed_rows)} 行 · range ${
@@ -750,7 +818,7 @@ function JobsPanel({ jobs, jobForm, onSave, onRun, onLoad, busy }) {
           >
             <List.Item.Meta
               title={job.name}
-              description={`${job.tables.join(", ")} · ${job.sync_strategy === "cursor" ? "大表游标" : "普通分页"}`}
+              description={`${job.tables.join(", ")} · ${syncStrategyLabel(job.sync_strategy, job.cursor_field, job.worker_count)}`}
             />
           </List.Item>
         )}
@@ -771,7 +839,7 @@ function HistoryPanel({ runs, onOpen }) {
             title={
               <Space>
                 <Text>{run.name}</Text>
-                <Tag>{run.status}</Tag>
+                <Tag>{runStatusLabel(run.status)}</Tag>
               </Space>
             }
             description={`${run.created_at} · ${run.tables.join(", ")}`}

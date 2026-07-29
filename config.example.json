@@ -22,7 +22,7 @@
     "write_timeout": 120
   },
   "app": {
-    "page_size": 1000,
+    "page_size": 5000,
     "data_dir": "./data",
     "log_dir": "./logs",
     "timezone": "Asia/Shanghai",

@@ -56,6 +56,41 @@ function pythonCommand() {
   };
 }
 
+function platformArchName() {
+  return `${process.platform}-${process.arch}`;
+}
+
+function executableName(name) {
+  return process.platform === "win32" ? `${name}.exe` : name;
+}
+
+function findBundledBackend() {
+  const backendPath = path.join(
+    appRootPath(),
+    "desktop",
+    "backend-dist",
+    platformArchName(),
+    "syncdog-backend",
+    executableName("syncdog-backend")
+  );
+  return fs.existsSync(backendPath) ? backendPath : null;
+}
+
+function backendCommand(port) {
+  const bundledBackend = findBundledBackend();
+  if (bundledBackend) {
+    return {
+      command: bundledBackend,
+      args: ["serve", "--host", "127.0.0.1", "--port", String(port)],
+    };
+  }
+  const python = pythonCommand();
+  return {
+    command: python.command,
+    args: [...python.args, "-m", "sync_tool.cli", "serve", "--host", "127.0.0.1", "--port", String(port)],
+  };
+}
+
 function findFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -95,7 +130,7 @@ function waitForBackend(url, timeoutMs = 30000) {
 }
 
 function startBackend(port) {
-  const python = pythonCommand();
+  const backend = backendCommand(port);
   const appRoot = appRootPath();
   const env = {
     ...process.env,
@@ -105,8 +140,8 @@ function startBackend(port) {
     PYTHONUNBUFFERED: "1",
   };
   backendProcess = spawn(
-    python.command,
-    [...python.args, "-m", "sync_tool.cli", "serve", "--host", "127.0.0.1", "--port", String(port)],
+    backend.command,
+    backend.args,
     {
       cwd: appRoot,
       env,

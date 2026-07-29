@@ -236,6 +236,44 @@ def indexed_columns(conn, table: str) -> set[str]:
         return {str(row["name"]) for row in cursor.fetchall()}
 
 
+def list_indexes(conn, table: str) -> list[dict[str, Any]]:
+    validate_identifier(table)
+    sql = """
+        SELECT INDEX_NAME AS index_name,
+               NON_UNIQUE AS non_unique,
+               COLUMN_NAME AS column_name,
+               SEQ_IN_INDEX AS seq_in_index
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+        ORDER BY INDEX_NAME, SEQ_IN_INDEX
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    with conn.cursor() as cursor:
+        cursor.execute(sql, (table,))
+        for row in cursor.fetchall():
+            name = str(row["index_name"])
+            item = grouped.setdefault(
+                name,
+                {
+                    "name": name,
+                    "unique": int(row["non_unique"] or 0) == 0,
+                    "primary": name == "PRIMARY",
+                    "columns": [],
+                },
+            )
+            item["columns"].append(str(row["column_name"]))
+    return list(grouped.values())
+
+
+def unique_index_for_columns(indexes: list[dict[str, Any]], columns: list[str]) -> dict[str, Any] | None:
+    wanted = list(columns)
+    for index in indexes:
+        if index.get("unique") and list(index.get("columns") or []) == wanted:
+            return index
+    return None
+
+
 def compare_column_shapes(prod_columns: list[dict[str, Any]], test_columns: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     prod_by_name = {str(item["name"]): item for item in prod_columns}
@@ -376,6 +414,58 @@ def fetch_cursor_batch(
         conditions.append((f"{cursor_sql} <= %s", (shard_end,)))
     where_sql, params = build_where(where_clause, conditions)
     sql = f"SELECT {column_sql} FROM {table_sql}{where_sql} ORDER BY {cursor_sql} LIMIT %s"
+    with conn.cursor() as cursor:
+        cursor.execute(sql, (*params, limit))
+        return list(cursor.fetchall())
+
+
+def cursor_seek_condition(cursor_fields: list[str], last_values: list[Any]) -> tuple[str, tuple[Any, ...]]:
+    if not cursor_fields or not last_values:
+        return "", ()
+    if len(cursor_fields) != len(last_values):
+        raise SQLValidationError("Cursor field count and last cursor value count do not match.")
+    clauses: list[str] = []
+    params: list[Any] = []
+    for index, field in enumerate(cursor_fields):
+        equals = [f"{quote_identifier(name)} <=> %s" for name in cursor_fields[:index]]
+        params.extend(last_values[:index])
+        if last_values[index] is None:
+            greater = f"{quote_identifier(field)} IS NOT NULL"
+        else:
+            greater = f"{quote_identifier(field)} > %s"
+            params.append(last_values[index])
+        clause = " AND ".join([*equals, greater])
+        clauses.append(f"({clause})")
+    return "(" + " OR ".join(clauses) + ")", tuple(params)
+
+
+def fetch_keyset_batch(
+    conn,
+    table: str,
+    columns: list[str],
+    where_clause: str | None,
+    cursor_fields: list[str],
+    limit: int,
+    *,
+    last_values: list[Any] | None = None,
+    shard_start: Any = None,
+    shard_end: Any = None,
+    extra_conditions: list[tuple[str, tuple[Any, ...]]] | None = None,
+) -> list[dict[str, Any]]:
+    if not cursor_fields:
+        raise SQLValidationError("Cursor fields are required for keyset pagination.")
+    table_sql = quote_identifier(table)
+    column_sql = quote_identifiers(columns)
+    conditions = list(extra_conditions or [])
+    if last_values:
+        conditions.append(cursor_seek_condition(cursor_fields, last_values))
+    elif shard_start is not None and len(cursor_fields) == 1:
+        conditions.append((f"{quote_identifier(cursor_fields[0])} >= %s", (shard_start,)))
+    if shard_end is not None and len(cursor_fields) == 1:
+        conditions.append((f"{quote_identifier(cursor_fields[0])} <= %s", (shard_end,)))
+    where_sql, params = build_where(where_clause, conditions)
+    order_sql = quote_identifiers(cursor_fields)
+    sql = f"SELECT {column_sql} FROM {table_sql}{where_sql} ORDER BY {order_sql} LIMIT %s"
     with conn.cursor() as cursor:
         cursor.execute(sql, (*params, limit))
         return list(cursor.fetchall())

@@ -1,15 +1,16 @@
 {
   "name": "sync-dog",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "description": "SyncDog desktop database sync app.",
   "main": "desktop/main.cjs",
   "private": true,
   "scripts": {
     "renderer:build": "vite --config desktop/renderer/vite.config.js build",
+    "backend:build": "/usr/bin/arch -arm64 .venv/bin/python -m PyInstaller --noconfirm --distpath build/pyinstaller/darwin-arm64 --workpath build/pyinstaller/work build/pyinstaller/spec/syncdog-backend.spec && rm -rf desktop/backend-dist/darwin-arm64 && mkdir -p desktop/backend-dist/darwin-arm64 && cp -RL build/pyinstaller/darwin-arm64/syncdog-backend desktop/backend-dist/darwin-arm64/syncdog-backend",
     "desktop": "npm run renderer:build && electron .",
     "desktop:dev": "npm run renderer:build && electron .",
-    "desktop:pack": "npm run renderer:build && electron-builder --mac dir",
-    "desktop:dist": "npm run renderer:build && electron-builder --mac dmg"
+    "desktop:pack": "npm run renderer:build && npm run backend:build && electron-builder --mac dir --arm64",
+    "desktop:dist": "npm run renderer:build && npm run backend:build && electron-builder --mac dmg --arm64"
   },
   "build": {
     "appId": "com.pdxjie.syncdog",
@@ -21,9 +22,6 @@
     "files": [
       "desktop/**/*",
       "assets/**/*",
-      "sync_tool/**/*",
-      ".venv/**/*",
-      "requirements.txt",
       "config.example.json",
       "README.md"
     ],
