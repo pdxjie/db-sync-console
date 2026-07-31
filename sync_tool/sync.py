@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import json
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from math import ceil
@@ -20,6 +21,8 @@ MAX_WORKERS = 8
 MAX_SHARDS = 64
 RECOMMENDED_CURSOR_BATCH_SIZE = 5000
 PROGRESS_AGGREGATE_INTERVAL_SECONDS = 1.5
+DEFAULT_RUN_WORKERS = 2
+RUN_ACTIVE_STATUSES = {"queued", "running", "pause_requested", "cancel_requested"}
 
 
 class SyncPlanError(RuntimeError):
@@ -1316,15 +1319,20 @@ class SyncEngine:
 
 
 class SyncManager:
-    def __init__(self, engine: SyncEngine, *, max_workers: int = 1):
+    def __init__(self, engine: SyncEngine, *, max_workers: int = DEFAULT_RUN_WORKERS):
         self.engine = engine
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = Lock()
         self._submitted: set[str] = set()
+        self._table_locks: dict[str, str] = {}
+        self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def start(self, payload: dict[str, Any], *, job_id: int | None = None, name: str | None = None) -> dict[str, Any]:
         run = self.engine.prepare_run(payload, job_id=job_id, name=name)
-        self._submit(run["id"], resume=False)
+        lock_tables = [] if run.get("dry_run") else list(run.get("tables") or [])
+        submission = self._activate_or_queue(run["id"], resume=False, locked_tables=lock_tables)
+        if submission:
+            self._submit_activated(submission)
         return self.get_run(run["id"])
 
     def resume(self, run_id: str) -> dict[str, Any]:
@@ -1334,9 +1342,15 @@ class SyncManager:
         with self._lock:
             if run_id in self._submitted:
                 raise SyncPlanError(f"Run {run_id} is still active. Wait for pause to finish before resuming.")
+            already_pending = run_id in self._pending
+        if already_pending:
+            return self.get_run(run_id)
+        lock_tables = run.get("tables") or []
         self.engine.store.update_run(run_id, status="queued", error=None, finished_at=None)
         self.engine.log(run_id, "info", "Run queued for resume.")
-        self._submit(run_id, resume=True)
+        submission = self._activate_or_queue(run_id, resume=True, locked_tables=lock_tables, exclude_run_id=run_id)
+        if submission:
+            self._submit_activated(submission)
         return self.get_run(run_id)
 
     def pause(self, run_id: str) -> dict[str, Any]:
@@ -1346,9 +1360,12 @@ class SyncManager:
         if run["status"] not in {"queued", "running", "pause_requested"}:
             raise SyncPlanError(f"Run {run_id} cannot be paused from status {run['status']}.")
         next_status = "pause_requested"
+        queued_without_worker = False
         with self._lock:
             if run["status"] == "queued" and run_id not in self._submitted:
                 next_status = "paused"
+                queued_without_worker = True
+                self._remove_pending_unlocked(run_id)
         self.engine.store.update_run(
             run_id,
             fetch=False,
@@ -1363,6 +1380,9 @@ class SyncManager:
         )
         if next_status == "paused":
             self.engine.log(run_id, "info", "Sync paused before execution started.")
+        if queued_without_worker:
+            for submission in self._drain_queue():
+                self._submit_activated(submission)
         return self.get_run(run_id)
 
     def cancel(self, run_id: str) -> dict[str, Any]:
@@ -1373,12 +1393,18 @@ class SyncManager:
             raise SyncPlanError(f"Run {run_id} cannot be canceled from status {run['status']}.")
 
         next_status = "cancel_requested"
+        queued_without_worker = False
         with self._lock:
             if run["status"] == "paused" or (run["status"] == "queued" and run_id not in self._submitted):
                 next_status = "canceled"
+                queued_without_worker = run["status"] == "queued"
+                self._remove_pending_unlocked(run_id)
 
         if next_status == "canceled":
             self.engine._finalize_canceled_run(run_id, run.get("current_table"))
+            if queued_without_worker:
+                for submission in self._drain_queue():
+                    self._submit_activated(submission)
         else:
             self.engine.store.update_run(
                 run_id,
@@ -1417,26 +1443,148 @@ class SyncManager:
     def get_run(self, run_id: str, *, log_limit: int = 120) -> dict[str, Any]:
         run = self.engine.store.get_run(run_id)
         metrics = self._run_metrics(run)
+        runtime_state = self._runtime_state(run_id, run.get("status"))
         return {
             **run,
             **metrics,
+            **runtime_state,
             "tables_state": self.engine.store.get_run_tables(run_id),
             "shards_state": self.engine.store.get_run_shards(run_id),
             "logs": self.engine.store.get_logs(run_id, log_limit),
         }
 
+    def list_runs(self, limit: int = 30) -> list[dict[str, Any]]:
+        return [
+            {**run, **self._run_metrics(run), **self._runtime_state(run["id"], run.get("status"))}
+            for run in self.engine.store.list_runs(limit)
+        ]
+
     def shutdown(self, wait: bool = False) -> None:
         self.executor.shutdown(wait=wait, cancel_futures=not wait)
 
-    def _submit(self, run_id: str, *, resume: bool) -> None:
-        with self._lock:
-            self._submitted.add(run_id)
+    def _submit_activated(self, submission: dict[str, Any]) -> None:
+        run_id = submission["run_id"]
+        resume = bool(submission.get("resume"))
+        if submission.get("from_pending"):
+            self.engine.log(run_id, "info", "表冲突已解除，排队任务已提交执行。")
         future = self.executor.submit(self.engine.execute_run, run_id, resume=resume)
         future.add_done_callback(lambda _: self._discard(run_id))
 
     def _discard(self, run_id: str) -> None:
+        submissions: list[dict[str, Any]]
         with self._lock:
             self._submitted.discard(run_id)
+            self._release_table_locks_unlocked(run_id)
+            submissions = self._drain_queue_unlocked()
+        for submission in submissions:
+            self._submit_activated(submission)
+
+    def _activate_or_queue(
+        self,
+        run_id: str,
+        *,
+        resume: bool,
+        locked_tables: list[str],
+        exclude_run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        locked_tables = list(dict.fromkeys(locked_tables))
+        with self._lock:
+            conflicts = self._table_conflicts_unlocked(locked_tables, exclude_run_id=exclude_run_id)
+            if conflicts:
+                self._pending[run_id] = {"run_id": run_id, "resume": resume, "locked_tables": locked_tables}
+                conflict_text = self._format_conflicts(conflicts)
+            else:
+                return self._activate_run_unlocked(run_id, resume=resume, locked_tables=locked_tables)
+        self.engine.log(run_id, "warning", f"表正在被其他任务同步，当前任务已自动排队：{conflict_text}。")
+        return None
+
+    def _activate_run_unlocked(self, run_id: str, *, resume: bool, locked_tables: list[str]) -> dict[str, Any]:
+        self._pending.pop(run_id, None)
+        for table in locked_tables:
+            self._table_locks[table] = run_id
+        self._submitted.add(run_id)
+        return {"run_id": run_id, "resume": resume, "locked_tables": locked_tables}
+
+    def _drain_queue(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._drain_queue_unlocked()
+
+    def _drain_queue_unlocked(self) -> list[dict[str, Any]]:
+        submissions: list[dict[str, Any]] = []
+        for run_id, pending in list(self._pending.items()):
+            locked_tables = list(pending.get("locked_tables") or [])
+            if self._table_conflicts_unlocked(locked_tables, exclude_run_id=run_id):
+                continue
+            submission = self._activate_run_unlocked(
+                run_id,
+                resume=bool(pending.get("resume")),
+                locked_tables=locked_tables,
+            )
+            submission["from_pending"] = True
+            submissions.append(submission)
+        return submissions
+
+    def _remove_pending_unlocked(self, run_id: str) -> None:
+        self._pending.pop(run_id, None)
+
+    def _reserve_tables(self, tables: list[str], *, exclude_run_id: str | None = None) -> str | None:
+        if not tables:
+            return None
+        reservation_id = f"reserve:{uuid.uuid4()}"
+        with self._lock:
+            conflicts = self._table_conflicts_unlocked(tables, exclude_run_id=exclude_run_id)
+            if conflicts:
+                conflict_text = self._format_conflicts(conflicts)
+                raise SyncPlanError(f"表冲突：{conflict_text}。请等待对应任务完成、暂停或取消后再启动。")
+            for table in tables:
+                self._table_locks[table] = reservation_id
+        return reservation_id
+
+    def _release_table_locks(self, owner: str | None) -> None:
+        if not owner:
+            return
+        with self._lock:
+            self._release_table_locks_unlocked(owner)
+
+    def _release_table_locks_unlocked(self, owner: str) -> None:
+        for table, current_owner in list(self._table_locks.items()):
+            if current_owner == owner:
+                self._table_locks.pop(table, None)
+
+    def _table_conflicts_unlocked(
+        self,
+        tables: list[str],
+        *,
+        exclude_run_id: str | None = None,
+    ) -> list[tuple[str, str, str]]:
+        conflicts: list[tuple[str, str, str]] = []
+        for table in tables:
+            owner = self._table_locks.get(table)
+            if not owner or owner == exclude_run_id:
+                continue
+            run_name = "准备中"
+            if not owner.startswith("reserve:"):
+                try:
+                    run = self.engine.store.get_run(owner)
+                    run_name = run.get("name") or owner
+                except KeyError:
+                    run_name = owner
+            conflicts.append((table, owner, run_name))
+        return conflicts
+
+    def _format_conflicts(self, conflicts: list[tuple[str, str, str]]) -> str:
+        return "；".join(f"{table} 正在被 {run_name} ({run_id[:8]}) 同步" for table, run_id, run_name in conflicts)
+
+    def _runtime_state(self, run_id: str, status: str | None) -> dict[str, Any]:
+        if status != "queued":
+            return {}
+        with self._lock:
+            if run_id in self._pending:
+                position = list(self._pending).index(run_id) + 1
+                return {"queue_state": "waiting_table", "queue_position": position}
+            if run_id in self._submitted:
+                return {"queue_state": "waiting_worker", "queue_position": None}
+        return {"queue_state": "queued", "queue_position": None}
 
     def _run_metrics(self, run: dict[str, Any]) -> dict[str, Any]:
         started_at = run.get("started_at")

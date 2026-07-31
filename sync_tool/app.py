@@ -109,7 +109,7 @@ engine = SyncEngine(lambda: effective_config(), store, event_callback=event_brok
 manager = SyncManager(engine)
 scheduler = JobScheduler(base_config, store, manager)
 
-app = FastAPI(title="同步犬", version="0.1.7")
+app = FastAPI(title="同步犬", version="0.1.10")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -217,7 +217,7 @@ def create_run(payload: SyncPayload):
 
 @app.get("/api/runs")
 def list_runs(limit: int = 30):
-    return {"runs": store.list_runs(limit)}
+    return {"runs": manager.list_runs(limit)}
 
 
 @app.get("/api/runs/{run_id}")

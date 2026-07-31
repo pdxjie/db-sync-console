@@ -35,12 +35,14 @@ import {
   CheckCircleOutlined,
   CloudSyncOutlined,
   DatabaseOutlined,
+  DownOutlined,
   FieldTimeOutlined,
   FolderOpenOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
   QuestionCircleOutlined,
   ReloadOutlined,
+  RightOutlined,
   SaveOutlined,
   SearchOutlined,
   SettingOutlined,
@@ -53,6 +55,7 @@ import "./styles.css";
 const { Header, Sider, Content } = Layout;
 const { Text, Title } = Typography;
 const APP_NAME = "同步犬";
+const APP_LOGO_URL = new URL("../../../assets/app-icon.png", import.meta.url).href;
 const BIG_TABLE_BATCH_SIZE = 5000;
 const RUN_STREAM_STATUSES = new Set(["queued", "running", "pause_requested", "cancel_requested"]);
 const RUN_PAUSABLE_STATUSES = new Set(["queued", "running", "pause_requested"]);
@@ -88,7 +91,7 @@ const HELP_TEXT = {
   dryRun:
     "创建一次运行记录并按真实流程检查读取、字段映射和 SQL 生成，但不向测试库写入数据，适合正式同步前验证。",
   start:
-    "开始把产品库中已选择表的数据写入测试库。建议先生成计划或 Dry-run，确认范围和条件后再正式执行。",
+    "开始把产品库中已选择表的数据写入测试库。同步过程中可以继续选择其他表启动新任务；同一张表会自动排队等待。",
   mode:
     "replace 使用 REPLACE INTO，主键或唯一键冲突时先删除旧行再插入；upsert 使用 INSERT ... ON DUPLICATE KEY UPDATE，只更新冲突行字段。",
   batchSize:
@@ -107,7 +110,8 @@ const HELP_TEXT = {
   where:
     "追加到每张表读取 SQL 的过滤条件，不需要写 WHERE 关键字。例如 created_at >= '2026-07-01'。",
   planPanel: "生成计划后在这里检查每张表的动作、字段数量、行数估算、读取方式、游标和分片。",
-  runPanel: "显示当前运行状态、进度、速度、已同步数据量、预计剩余时间、表进度、分片进度和本地日志。",
+  runPanel: "显示多个运行任务的状态、进度、速度、已同步数据量、预计剩余时间、表进度、分片进度和本地日志。不同表可并行，同表会自动排队。",
+  runBatch: "批量操作当前活动任务。暂停会等批次提交后停住；取消后不能继续，已经提交到测试库的数据不会自动回滚。",
   pause: "请求暂停。为了避免半批次写入，会等当前批次提交或结束后停住，之后可以继续。",
   cancel: "取消当前任务。不会直接强杀正在执行的 MySQL SQL，会在下一个批次检查点停住；取消后这个运行记录不能继续。",
   resume: "继续已暂停或失败的任务。大表模式会从 last_pk 断点继续，普通模式会从记录的进度继续。",
@@ -129,7 +133,7 @@ const DOC_SECTIONS = [
       "点击右上角连接，填写产品库和测试库。产品库建议使用只读账号，测试库需要写入权限。",
       "测试并登录成功后，左侧会显示产品库表列表。搜索表名并勾选要同步的表。",
       "在中间配置写入模式、分页大小、where 条件和大表相关参数。",
-      "先点生成计划检查影响范围，再点 Dry-run 验证流程，最后点开始同步正式写入测试库。",
+      "先点生成计划检查影响范围，再点 Dry-run 验证流程，最后点开始同步正式写入测试库。同步中可以继续选择其他表发起新任务。",
     ],
   },
   {
@@ -170,14 +174,14 @@ const DOC_SECTIONS = [
     items: [
       "生成计划只预检不写库，用来确认表、字段、行数、策略、游标、分片和风险提示。",
       "Dry-run 会创建运行记录并走完整读取和 SQL 生成流程，但不会向测试库写入数据。",
-      "开始同步会正式写入测试库。建议对大表先设置 where 或增量条件，再从较小分页和 2 到 4 并发开始试。",
+      "开始同步会正式写入测试库。不同表可以同时启动多个任务；同一张表会自动排队等待。建议对大表先设置 where 或增量条件，再从较小分页和 2 到 4 并发开始试。",
     ],
   },
   {
     title: "运行控制和进度",
     items: [
       "运行页显示状态、百分比、每秒行数、已同步 GB、预计剩余时间和耗时。",
-      "暂停会等待当前批次结束后停止，之后可以继续。取消不会直接强杀正在执行的 MySQL SQL，会在下一个批次检查点停住，取消后的运行记录不能继续。",
+      "暂停会等待当前批次结束后停止，之后可以继续。取消不会直接强杀正在执行的 MySQL SQL，会在下一个批次检查点停住，取消后的运行记录不能继续，已经提交到测试库的数据不会自动回滚。",
       "大表分片会显示每个 shard 的 range 和 last_pk。出现失败后可以根据日志判断是否继续或调整参数重跑。",
     ],
   },
@@ -253,6 +257,15 @@ function runStatusLabel(status) {
   return labels[status] || status || "-";
 }
 
+function queueStateText(run) {
+  if (run?.status !== "queued") return "";
+  if (run.queue_state === "waiting_table") {
+    return `等待同表任务完成${run.queue_position ? ` · 队列 #${run.queue_position}` : ""}`;
+  }
+  if (run.queue_state === "waiting_worker") return "等待空闲 worker";
+  return "等待调度";
+}
+
 function blankConnection() {
   return {
     host: "",
@@ -296,7 +309,9 @@ function AppShell() {
   const [plan, setPlan] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [runs, setRuns] = useState([]);
-  const [currentRun, setCurrentRun] = useState(null);
+  const [runDetails, setRunDetails] = useState({});
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [collapsedRunIds, setCollapsedRunIds] = useState(() => new Set());
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
   const [connectionForm] = Form.useForm();
@@ -316,13 +331,82 @@ function AppShell() {
 
   const connectionReady = Boolean(status?.connection_ready);
   const selectedCount = selectedTables.length;
-  const runStreamKey = currentRun && RUN_STREAM_STATUSES.has(currentRun.status) ? currentRun.id : "";
 
   const filteredTables = useMemo(() => {
     const query = tableQuery.trim().toLowerCase();
     if (!query) return tables;
     return tables.filter((item) => item.name.toLowerCase().includes(query));
   }, [tables, tableQuery]);
+
+  const mergedRuns = useMemo(() => {
+    const items = new Map();
+    for (const run of runs) {
+      items.set(run.id, { ...run, ...(runDetails[run.id] || {}) });
+    }
+    for (const run of Object.values(runDetails)) {
+      items.set(run.id, { ...(items.get(run.id) || {}), ...run });
+    }
+    return Array.from(items.values()).sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  }, [runs, runDetails]);
+
+  const activeRunIds = useMemo(
+    () => mergedRuns.filter((run) => RUN_STREAM_STATUSES.has(run.status)).map((run) => run.id),
+    [mergedRuns],
+  );
+
+  const runPanelRuns = useMemo(() => {
+    const visible = new Map();
+    for (const run of mergedRuns) {
+      if (RUN_STREAM_STATUSES.has(run.status)) visible.set(run.id, run);
+    }
+    const selected = mergedRuns.find((run) => run.id === selectedRunId);
+    if (selected) visible.set(selected.id, selected);
+    if (!visible.size && mergedRuns[0]) visible.set(mergedRuns[0].id, mergedRuns[0]);
+    return Array.from(visible.values()).sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  }, [mergedRuns, selectedRunId]);
+
+  const pausableRunCount = useMemo(
+    () => mergedRuns.filter((run) => RUN_PAUSABLE_STATUSES.has(run.status)).length,
+    [mergedRuns],
+  );
+  const cancelableRunCount = useMemo(
+    () => mergedRuns.filter((run) => RUN_STREAM_STATUSES.has(run.status) && RUN_CANCELABLE_STATUSES.has(run.status)).length,
+    [mergedRuns],
+  );
+
+  function upsertRun(run) {
+    setRunDetails((previous) => ({ ...previous, [run.id]: { ...(previous[run.id] || {}), ...run } }));
+    setRuns((previous) => {
+      const exists = previous.some((item) => item.id === run.id);
+      const next = exists ? previous.map((item) => (item.id === run.id ? { ...item, ...run } : item)) : [run, ...previous];
+      return next.slice(0, 30);
+    });
+  }
+
+  function expandRun(runId) {
+    setCollapsedRunIds((previous) => {
+      if (!previous.has(runId)) return previous;
+      const next = new Set(previous);
+      next.delete(runId);
+      return next;
+    });
+    setSelectedRunId(runId);
+  }
+
+  function collapseRun(run) {
+    setSelectedRunId((previous) => (previous === run.id ? "" : previous));
+    if (RUN_STREAM_STATUSES.has(run.status)) {
+      setCollapsedRunIds((previous) => {
+        const next = new Set(previous);
+        next.add(run.id);
+        return next;
+      });
+    }
+  }
+
+  function isRunExpanded(run) {
+    return run.id === selectedRunId || (RUN_STREAM_STATUSES.has(run.status) && !collapsedRunIds.has(run.id));
+  }
 
   async function refreshStatus() {
     const payload = await api("/api/status");
@@ -394,70 +478,75 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    if (!runStreamKey) return undefined;
-    const source = new EventSource(`${API_BASE}/api/runs/${encodeURIComponent(runStreamKey)}/events?logs_limit=80`);
-    let closed = false;
-    let fallbackTimer = null;
-    let catchupTimer = null;
-    let lastEventAt = Date.now();
-    const applyRun = (run) => {
-      setCurrentRun(run);
-      if (!RUN_STREAM_STATUSES.has(run.status)) {
-        closed = true;
+    if (!activeRunIds.length) return undefined;
+    const streams = activeRunIds.map((runId) => {
+      const source = new EventSource(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/events?logs_limit=80`);
+      const state = {
+        closed: false,
+        fallbackTimer: null,
+        catchupTimer: null,
+        lastEventAt: Date.now(),
+      };
+      const applyRun = (run) => {
+        upsertRun(run);
+        if (!RUN_STREAM_STATUSES.has(run.status)) {
+          state.closed = true;
+          source.close();
+          refreshRuns().catch((error) => message.error(error.message));
+          return false;
+        }
+        return true;
+      };
+      const fetchRunSnapshot = async () => {
+        const run = await api(`/api/runs/${runId}?logs_limit=80`);
+        return { active: applyRun(run), status: run.status };
+      };
+      const pollFallback = () => {
+        fetchRunSnapshot()
+          .then(({ active, status }) => {
+            if (active && !state.closed) {
+              state.fallbackTimer = window.setTimeout(pollFallback, status === "pause_requested" ? 700 : 1400);
+            }
+          })
+          .catch((error) => message.error(error.message));
+      };
+      const handleRunEvent = (event) => {
+        try {
+          state.lastEventAt = Date.now();
+          applyRun(JSON.parse(event.data));
+        } catch (error) {
+          message.error(error.message);
+        }
+      };
+      source.addEventListener("run", handleRunEvent);
+      source.onmessage = handleRunEvent;
+      source.onerror = () => {
+        if (state.closed) return;
         source.close();
-        refreshRuns().catch((error) => message.error(error.message));
-        return false;
-      }
-      return true;
-    };
-    const fetchRunSnapshot = async () => {
-      const run = await api(`/api/runs/${runStreamKey}?logs_limit=80`);
-      return { active: applyRun(run), status: run.status };
-    };
-    const pollFallback = () => {
-      fetchRunSnapshot()
-        .then(({ active, status }) => {
-          if (active && !closed) {
-            fallbackTimer = window.setTimeout(pollFallback, status === "pause_requested" ? 700 : 1400);
-          }
-        })
-        .catch((error) => message.error(error.message));
-    };
-    const handleRunEvent = (event) => {
-      try {
-        lastEventAt = Date.now();
-        const run = JSON.parse(event.data);
-        applyRun(run);
-      } catch (error) {
-        message.error(error.message);
-      }
-    };
-    source.addEventListener("run", handleRunEvent);
-    source.onmessage = handleRunEvent;
-    source.onerror = () => {
-      if (closed) return;
-      closed = true;
-      source.close();
-      pollFallback();
-    };
-    catchupTimer = window.setInterval(() => {
-      if (closed || Date.now() - lastEventAt < 5000) return;
-      fetchRunSnapshot()
-        .then(() => {
-          lastEventAt = Date.now();
-        })
-        .catch(() => {
-          if (!closed) source.onerror();
-        });
-    }, 5000);
+        pollFallback();
+      };
+      state.catchupTimer = window.setInterval(() => {
+        if (state.closed || Date.now() - state.lastEventAt < 5000) return;
+        fetchRunSnapshot()
+          .then(() => {
+            state.lastEventAt = Date.now();
+          })
+          .catch(() => {
+            if (!state.closed) source.onerror();
+          });
+      }, 5000);
+      return { source, state, handleRunEvent };
+    });
     return () => {
-      closed = true;
-      window.clearTimeout(fallbackTimer);
-      window.clearInterval(catchupTimer);
-      source.removeEventListener("run", handleRunEvent);
-      source.close();
+      for (const { source, state, handleRunEvent } of streams) {
+        state.closed = true;
+        window.clearTimeout(state.fallbackTimer);
+        window.clearInterval(state.catchupTimer);
+        source.removeEventListener("run", handleRunEvent);
+        source.close();
+      }
     };
-  }, [runStreamKey]);
+  }, [activeRunIds.join(",")]);
 
   function changeSyncStrategy(value) {
     setSyncStrategy(value);
@@ -515,7 +604,9 @@ function AppShell() {
         method: "POST",
         body: JSON.stringify(payload),
       });
-      setCurrentRun(run);
+      upsertRun(run);
+      expandRun(run.id);
+      await refreshRuns();
       message.success(dryRun ? "dry-run 已加入队列" : "同步已启动");
     } catch (error) {
       message.error(error.message);
@@ -553,7 +644,9 @@ function AppShell() {
     setBusy(true);
     try {
       const run = await api(`/api/jobs/${job.id}/run`, { method: "POST" });
-      setCurrentRun(run);
+      upsertRun(run);
+      expandRun(run.id);
+      await refreshRuns();
       message.success("任务已启动");
     } catch (error) {
       message.error(error.message);
@@ -588,34 +681,62 @@ function AppShell() {
   }
 
   async function openRun(run) {
+    if (isRunExpanded(run)) {
+      collapseRun(run);
+      return;
+    }
     try {
       const detail = await api(`/api/runs/${run.id}?logs_limit=120`);
-      setCurrentRun(detail);
+      upsertRun(detail);
+      expandRun(detail.id);
     } catch (error) {
       message.error(error.message);
     }
   }
 
-  async function resumeRun() {
-    if (!currentRun) return;
+  async function resumeRun(runId) {
     try {
-      const run = await api(`/api/runs/${currentRun.id}/resume`, { method: "POST" });
-      setCurrentRun(run);
+      const run = await api(`/api/runs/${runId}/resume`, { method: "POST" });
+      upsertRun(run);
+      expandRun(run.id);
+      await refreshRuns();
       message.success("已继续");
     } catch (error) {
       message.error(error.message);
     }
   }
 
-  async function pauseRun() {
-    if (!currentRun) return;
+  async function pauseRun(runId) {
     try {
-      const run = await api(`/api/runs/${currentRun.id}/pause`, { method: "POST" });
-      setCurrentRun(run);
+      const run = await api(`/api/runs/${runId}/pause`, { method: "POST" });
+      upsertRun(run);
+      expandRun(run.id);
       message.success("已请求暂停，当前批次完成后会停住");
     } catch (error) {
       message.error(error.message);
     }
+  }
+
+  async function pauseActiveRuns() {
+    const targets = mergedRuns.filter((run) => RUN_PAUSABLE_STATUSES.has(run.status));
+    if (!targets.length) {
+      message.info("没有可暂停的活动任务");
+      return;
+    }
+    const results = await Promise.allSettled(
+      targets.map((run) => api(`/api/runs/${run.id}/pause`, { method: "POST" })),
+    );
+    let successCount = 0;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        successCount += 1;
+        upsertRun(result.value);
+      } else {
+        message.error(result.reason?.message || "暂停失败");
+      }
+    }
+    await refreshRuns();
+    if (successCount) message.success(`已请求暂停 ${successCount} 个任务`);
   }
 
   function startResizeLeftPane(event) {
@@ -637,15 +758,37 @@ function AppShell() {
     window.addEventListener("mouseup", onUp);
   }
 
-  async function cancelRun() {
-    if (!currentRun) return;
+  async function cancelRun(runId) {
     try {
-      const run = await api(`/api/runs/${currentRun.id}/cancel`, { method: "POST" });
-      setCurrentRun(run);
+      const run = await api(`/api/runs/${runId}/cancel`, { method: "POST" });
+      upsertRun(run);
+      expandRun(run.id);
       message.warning(run.status === "canceled" ? "已取消" : "已请求取消，当前批次完成后会停住");
     } catch (error) {
       message.error(error.message);
     }
+  }
+
+  async function cancelActiveRuns() {
+    const targets = mergedRuns.filter((run) => RUN_STREAM_STATUSES.has(run.status) && RUN_CANCELABLE_STATUSES.has(run.status));
+    if (!targets.length) {
+      message.info("没有可取消的活动任务");
+      return;
+    }
+    const results = await Promise.allSettled(
+      targets.map((run) => api(`/api/runs/${run.id}/cancel`, { method: "POST" })),
+    );
+    let successCount = 0;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        successCount += 1;
+        upsertRun(result.value);
+      } else {
+        message.error(result.reason?.message || "取消失败");
+      }
+    }
+    await refreshRuns();
+    if (successCount) message.warning(`已请求取消 ${successCount} 个任务`);
   }
 
   async function saveConnections(login = false) {
@@ -684,22 +827,19 @@ function AppShell() {
     }
   }
 
-  const runPercent = currentRun?.total_rows
-    ? Math.min(100, Math.round((currentRun.processed_rows / currentRun.total_rows) * 100))
-    : currentRun?.status === "success"
-      ? 100
-      : 0;
-
   return (
     <Layout className="desktop-root">
       <Header className="app-header">
         <div className="window-drag-space" />
         <div className="title-block">
-          <Title level={4}>{APP_NAME}</Title>
-          <Text type="secondary">
-            {status?.config?.prod?.database || "prod"} @ {status?.config?.prod?.host || "-"} →{" "}
-            {status?.config?.test?.database || "test"} @ {status?.config?.test?.host || "-"}
-          </Text>
+          <img className="app-logo" src={APP_LOGO_URL} alt="" draggable={false} />
+          <div className="title-copy">
+            <Title level={4}>{APP_NAME}</Title>
+            <Text type="secondary">
+              {status?.config?.prod?.database || "prod"} @ {status?.config?.prod?.host || "-"} →{" "}
+              {status?.config?.test?.database || "test"} @ {status?.config?.test?.host || "-"}
+            </Text>
+          </div>
         </div>
         <Space>
           <Badge status={connectionReady ? "success" : "default"} text={connectionReady ? "已连接" : "未连接"} />
@@ -943,12 +1083,17 @@ function AppShell() {
                   </span>
                 ),
                 children: (
-                  <RunPanel
-                    run={currentRun}
-                    percent={runPercent}
+                  <RunsPanel
+                    runs={runPanelRuns}
+                    isRunExpanded={isRunExpanded}
+                    pausableRunCount={pausableRunCount}
+                    cancelableRunCount={cancelableRunCount}
+                    onOpen={openRun}
                     onResume={resumeRun}
                     onPause={pauseRun}
                     onCancel={cancelRun}
+                    onPauseAll={pauseActiveRuns}
+                    onCancelAll={cancelActiveRuns}
                   />
                 ),
               },
@@ -1014,10 +1159,71 @@ function SectionHeader({ icon, title, extra, help }) {
   );
 }
 
-function RunPanel({ run, percent, onResume, onPause, onCancel }) {
-  if (!run) {
+function runPercent(run) {
+  if (run?.total_rows) {
+    return Math.min(100, Math.round((run.processed_rows / run.total_rows) * 100));
+  }
+  return run?.status === "success" ? 100 : 0;
+}
+
+function RunsPanel({
+  runs,
+  isRunExpanded,
+  pausableRunCount,
+  cancelableRunCount,
+  onOpen,
+  onResume,
+  onPause,
+  onCancel,
+  onPauseAll,
+  onCancelAll,
+}) {
+  if (!runs.length) {
     return <Empty className="pane-empty" description="尚无运行" />;
   }
+  return (
+    <div className="runs-panel">
+      <div className="runs-toolbar">
+        <span className="runs-toolbar-title">
+          <Text type="secondary">活动 {pausableRunCount || cancelableRunCount || 0}</Text>
+          <HelpTip title={HELP_TEXT.runBatch} />
+        </span>
+        <Space size={6}>
+          <Button size="small" icon={<PauseCircleOutlined />} disabled={!pausableRunCount} onClick={onPauseAll}>
+            暂停全部
+          </Button>
+          <Popconfirm
+            title="取消所有活动任务？"
+            description="已经提交的批次不会自动回滚。"
+            okText="取消任务"
+            cancelText="再想想"
+            okButtonProps={{ danger: true }}
+            onConfirm={onCancelAll}
+          >
+            <Button size="small" danger icon={<StopOutlined />} disabled={!cancelableRunCount}>
+              取消全部
+            </Button>
+          </Popconfirm>
+        </Space>
+      </div>
+      <Space direction="vertical" size={10} className="full-width">
+        {runs.map((run) => (
+          <RunCard
+            key={run.id}
+            run={run}
+            expanded={isRunExpanded(run)}
+            onOpen={onOpen}
+            onResume={onResume}
+            onPause={onPause}
+            onCancel={onCancel}
+          />
+        ))}
+      </Space>
+    </div>
+  );
+}
+
+function RunCard({ run, expanded, onOpen, onResume, onPause, onCancel }) {
   const statusColor =
     run.status === "success"
       ? "success"
@@ -1030,15 +1236,23 @@ function RunPanel({ run, percent, onResume, onPause, onCancel }) {
   const canCancel = RUN_CANCELABLE_STATUSES.has(run.status);
   const canResume = RUN_RESUMABLE_STATUSES.has(run.status);
   const shards = run.shards_state || [];
+  const percent = runPercent(run);
+  const queueText = queueStateText(run);
   return (
-    <div className="run-panel">
-      <Space direction="vertical" size={12} className="full-width">
-        <Space className="run-title" align="center">
-          <Badge status={statusColor} />
-          <Text strong>{run.name}</Text>
-          <Tag>{runStatusLabel(run.status)}</Tag>
-          <Tag>{syncStrategyLabel(run.sync_strategy, run.cursor_field, run.worker_count)}</Tag>
-        </Space>
+    <div className={`run-card ${expanded ? "run-card-expanded" : ""}`}>
+      <Space direction="vertical" size={10} className="full-width">
+        <button className="run-card-header" onClick={() => onOpen(run)}>
+          <span className="run-title">
+            {expanded ? <DownOutlined className="run-expand-icon" /> : <RightOutlined className="run-expand-icon" />}
+            <Badge status={statusColor} />
+            <Text strong ellipsis>{run.name}</Text>
+          </span>
+          <span className="run-card-tags">
+            <Tag>{runStatusLabel(run.status)}</Tag>
+            <Tag>{syncStrategyLabel(run.sync_strategy, run.cursor_field, run.worker_count)}</Tag>
+          </span>
+        </button>
+        {queueText ? <Text className="run-queue-note" type="secondary">{queueText}</Text> : null}
         <Progress percent={percent} status={run.status === "failed" ? "exception" : undefined} />
         <div className="metric-grid">
           <Statistic title={<FieldLabel label="速度" help="当前运行平均吞吐，单位是每秒处理行数。" />} value={run.rows_per_second || 0} precision={2} suffix="行/秒" />
@@ -1051,7 +1265,7 @@ function RunPanel({ run, percent, onResume, onPause, onCancel }) {
             <span className="action-with-help">
               <Button
                 icon={<PauseCircleOutlined />}
-                onClick={onPause}
+                onClick={() => onPause(run.id)}
                 loading={run.status === "pause_requested"}
                 disabled={run.status === "pause_requested" || run.status === "cancel_requested"}
               >
@@ -1068,7 +1282,7 @@ function RunPanel({ run, percent, onResume, onPause, onCancel }) {
                 okText="取消同步"
                 cancelText="再想想"
                 okButtonProps={{ danger: true }}
-                onConfirm={onCancel}
+                onConfirm={() => onCancel(run.id)}
               >
                 <Button danger icon={<StopOutlined />} loading={run.status === "cancel_requested"} disabled={run.status === "cancel_requested"}>
                   {run.status === "cancel_requested" ? "取消中" : "取消"}
@@ -1079,61 +1293,66 @@ function RunPanel({ run, percent, onResume, onPause, onCancel }) {
           ) : null}
           {canResume ? (
             <span className="action-with-help">
-              <Button type={run.status === "paused" ? "primary" : "default"} danger={run.status === "failed"} onClick={onResume}>
+              <Button type={run.status === "paused" ? "primary" : "default"} danger={run.status === "failed"} onClick={() => onResume(run.id)}>
                 继续
               </Button>
               <ActionHelp help={HELP_TEXT.resume} />
             </span>
           ) : null}
         </div>
-        <List
-          size="small"
-          dataSource={run.tables_state || []}
-          renderItem={(table) => (
-            <List.Item>
-              <List.Item.Meta
-                title={
-                  <Space>
-                    <Text>{table.table_name}</Text>
-                    <Tag>{runStatusLabel(table.status)}</Tag>
-                  </Space>
-                }
-                description={`${formatNumber(table.processed_rows)} / ${formatNumber(table.total_rows)} 行 · ${
-                  table.cursor_field ? `last_pk ${table.last_pk || "-"}` : `offset ${formatNumber(table.offset_value)}`
-                }`}
-              />
-            </List.Item>
-          )}
-        />
-        {shards.length ? (
-          <div className="shard-panel">
-            <Text strong>分片进度</Text>
+        {expanded ? (
+          <>
             <List
               size="small"
-              dataSource={shards}
-              renderItem={(shard) => (
+              dataSource={run.tables_state || []}
+              locale={{ emptyText: <Empty description="点击任务可加载详情" /> }}
+              renderItem={(table) => (
                 <List.Item>
                   <List.Item.Meta
                     title={
                       <Space>
-                        <Text>#{shard.shard_index}</Text>
-                        <Tag>{runStatusLabel(shard.status)}</Tag>
+                        <Text>{table.table_name}</Text>
+                        <Tag>{runStatusLabel(table.status)}</Tag>
                       </Space>
                     }
-                    description={`${formatNumber(shard.processed_rows)} 行 · range ${
-                      shard.start_pk || "-"
-                    }..${shard.end_pk || "-"} · last_pk ${shard.last_pk || "-"}`}
+                    description={`${formatNumber(table.processed_rows)} / ${formatNumber(table.total_rows)} 行 · ${
+                      table.cursor_field ? `last_pk ${table.last_pk || "-"}` : `offset ${formatNumber(table.offset_value)}`
+                    }`}
                   />
                 </List.Item>
               )}
             />
-          </div>
+            {shards.length ? (
+              <div className="shard-panel">
+                <Text strong>分片进度</Text>
+                <List
+                  size="small"
+                  dataSource={shards}
+                  renderItem={(shard) => (
+                    <List.Item>
+                      <List.Item.Meta
+                        title={
+                          <Space>
+                            <Text>#{shard.shard_index}</Text>
+                            <Tag>{runStatusLabel(shard.status)}</Tag>
+                          </Space>
+                        }
+                        description={`${formatNumber(shard.processed_rows)} 行 · range ${
+                          shard.start_pk || "-"
+                        }..${shard.end_pk || "-"} · last_pk ${shard.last_pk || "-"}`}
+                      />
+                    </List.Item>
+                  )}
+                />
+              </div>
+            ) : null}
+            <pre className="log-box">
+              {(run.logs || [])
+                .map((item) => `${item.created_at} [${item.level.toUpperCase()}] ${item.message}`)
+                .join("\n")}
+            </pre>
+          </>
         ) : null}
-        <pre className="log-box">
-          {(run.logs || [])
-            .map((item) => `${item.created_at} [${item.level.toUpperCase()}] ${item.message}`)
-            .join("\n")}
-        </pre>
       </Space>
     </div>
   );
