@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import struct
 import subprocess
+import sys
 import zlib
 from pathlib import Path
 
@@ -215,12 +216,12 @@ def png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
 
 
-def save_png(path: Path, width: int, height: int, pixels: bytearray) -> None:
+def png_bytes(width: int, height: int, pixels: bytearray) -> bytes:
     rows = []
     stride = width * 4
     for y in range(height):
         rows.append(b"\x00" + bytes(pixels[y * stride : (y + 1) * stride]))
-    data = b"".join(
+    return b"".join(
         [
             b"\x89PNG\r\n\x1a\n",
             png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)),
@@ -228,7 +229,37 @@ def save_png(path: Path, width: int, height: int, pixels: bytearray) -> None:
             png_chunk(b"IEND", b""),
         ]
     )
-    path.write_bytes(data)
+
+
+def save_png(path: Path, width: int, height: int, pixels: bytearray) -> None:
+    path.write_bytes(png_bytes(width, height, pixels))
+
+
+def save_ico(path: Path, images: list[tuple[int, bytes]]) -> None:
+    header_size = 6
+    entry_size = 16
+    offset = header_size + entry_size * len(images)
+    entries = []
+    payloads = []
+    for size, payload in images:
+        width_byte = 0 if size >= 256 else size
+        height_byte = 0 if size >= 256 else size
+        entries.append(
+            struct.pack(
+                "<BBBBHHII",
+                width_byte,
+                height_byte,
+                0,
+                0,
+                1,
+                32,
+                len(payload),
+                offset,
+            )
+        )
+        payloads.append(payload)
+        offset += len(payload)
+    path.write_bytes(struct.pack("<HHH", 0, 1, len(images)) + b"".join(entries) + b"".join(payloads))
 
 
 def downsample(source: bytearray, source_size: int, target_size: int) -> bytearray:
@@ -272,7 +303,14 @@ def main() -> None:
     for filename, target_size in icon_sizes.items():
         save_png(ICONSET / filename, target_size, target_size, downsample(master, SIZE, target_size))
 
-    subprocess.run(["iconutil", "-c", "icns", str(ICONSET), "-o", str(ASSETS / "app-icon.icns")], check=True)
+    ico_images = []
+    for target_size in (16, 24, 32, 48, 64, 128, 256):
+        pixels = downsample(master, SIZE, target_size)
+        ico_images.append((target_size, png_bytes(target_size, target_size, pixels)))
+    save_ico(ASSETS / "app-icon.ico", ico_images)
+
+    if sys.platform == "darwin":
+        subprocess.run(["iconutil", "-c", "icns", str(ICONSET), "-o", str(ASSETS / "app-icon.icns")], check=True)
 
 
 if __name__ == "__main__":
