@@ -79,6 +79,8 @@ class ConnectionTestPayload(BaseModel):
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
+RENDERER_DIST_ROOT = PROJECT_ROOT / "desktop" / "renderer" / "dist"
+RENDERER_ASSETS_ROOT = RENDERER_DIST_ROOT / "assets"
 CONFIG_PATH = Path(os.getenv("DB_SYNC_CONFIG") or os.getenv("MYSQL_SYNC_CONFIG") or PROJECT_ROOT / "config.json").expanduser().resolve()
 
 
@@ -118,6 +120,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
+if RENDERER_ASSETS_ROOT.exists():
+    app.mount("/assets", StaticFiles(directory=RENDERER_ASSETS_ROOT), name="renderer-assets")
 
 
 @app.on_event("startup")
@@ -135,6 +139,9 @@ def on_shutdown() -> None:
 
 @app.get("/")
 def index():
+    renderer_index = RENDERER_DIST_ROOT / "index.html"
+    if renderer_index.exists():
+        return FileResponse(renderer_index)
     return FileResponse(STATIC_ROOT / "index.html")
 
 
