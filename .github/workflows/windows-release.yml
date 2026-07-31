@@ -1,0 +1,94 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to upload to, for example v0.1.11"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt PyInstaller
+
+      - name: Build Windows installer
+        run: npm run desktop:dist:win
+
+      - name: Normalize artifacts
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          New-Item -ItemType Directory -Force release-windows | Out-Null
+          $installer = Get-ChildItem release -Filter "SyncDog-$version-win-x64.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows installer was not generated"
+          }
+          Copy-Item $installer.FullName "release-windows/SyncDog-$version-win-x64.exe"
+          $blockmap = Get-ChildItem release -Filter "SyncDog-$version-win-x64.exe.blockmap" | Select-Object -First 1
+          if ($blockmap) {
+            Copy-Item $blockmap.FullName "release-windows/SyncDog-$version-win-x64.exe.blockmap"
+          }
+          if (Test-Path "release/latest.yml") {
+            Copy-Item "release/latest.yml" "release-windows/SyncDog-$version-win-x64-latest.yml"
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SyncDog-windows-x64
+          path: release-windows/*
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = node -p "require('./package.json').version"
+          $inputTag = "${{ github.event.inputs.tag_name }}"
+          if ($inputTag) {
+            $tag = $inputTag
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $tag = "v$version"
+          }
+          gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo "$env:GITHUB_REPOSITORY" --target "${{ github.sha }}" --title "同步犬 $version" --notes "Windows x64 installer for 同步犬 $version."
+          }
+          gh release upload $tag release-windows/* --repo "$env:GITHUB_REPOSITORY" --clobber

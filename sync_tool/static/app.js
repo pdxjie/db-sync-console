@@ -3,12 +3,20 @@ const state = {
   selected: new Set(),
   currentRunId: null,
   pollTimer: null,
+  catchupTimer: null,
+  runEvents: null,
+  tableScrollTop: 0,
+  tableFrame: null,
   connectionReady: false,
   desktop: Boolean(window.dbSyncDesktop?.isDesktop),
 };
 
-const ACTIVE_RUN_STATUSES = new Set(["queued", "running", "pause_requested"]);
+const RUN_STREAM_STATUSES = new Set(["queued", "running", "pause_requested", "cancel_requested"]);
+const RUN_PAUSABLE_STATUSES = new Set(["queued", "running", "pause_requested"]);
+const RUN_CANCELABLE_STATUSES = new Set(["queued", "running", "pause_requested", "paused", "cancel_requested"]);
 const RESUMABLE_RUN_STATUSES = new Set(["failed", "paused"]);
+const TABLE_ROW_HEIGHT = 38;
+const TABLE_OVERSCAN = 8;
 
 const $ = (id) => document.getElementById(id);
 
@@ -67,6 +75,7 @@ const els = {
   runStatus: $("runStatus"),
   runMetrics: $("runMetrics"),
   pauseBtn: $("pauseBtn"),
+  cancelBtn: $("cancelBtn"),
   resumeBtn: $("resumeBtn"),
   progressBar: $("progressBar"),
   runTables: $("runTables"),
@@ -126,6 +135,8 @@ function runStatusLabel(status) {
     running: "同步中",
     pause_requested: "暂停中",
     paused: "已暂停",
+    cancel_requested: "取消中",
+    canceled: "已取消",
     success: "已完成",
     failed: "失败",
   };
@@ -272,7 +283,17 @@ function renderTables() {
     updateSelectedCount();
     return;
   }
-  for (const table of tables) {
+  const viewportHeight = els.tableList.clientHeight || 360;
+  const start = Math.max(0, Math.floor(state.tableScrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN);
+  const visibleCount = Math.ceil(viewportHeight / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2;
+  const end = Math.min(tables.length, start + visibleCount);
+  const spacer = document.createElement("div");
+  spacer.className = "table-virtual-spacer";
+  spacer.style.height = `${tables.length * TABLE_ROW_HEIGHT}px`;
+  const windowNode = document.createElement("div");
+  windowNode.className = "table-virtual-window";
+  windowNode.style.transform = `translateY(${start * TABLE_ROW_HEIGHT}px)`;
+  for (const table of tables.slice(start, end)) {
     const row = document.createElement("label");
     row.className = "table-item";
     const checkbox = document.createElement("input");
@@ -291,8 +312,10 @@ function renderTables() {
     count.className = "row-count";
     count.textContent = formatNumber(table.estimated_rows);
     row.append(checkbox, name, count);
-    els.tableList.append(row);
+    windowNode.append(row);
   }
+  spacer.append(windowNode);
+  els.tableList.append(spacer);
   updateSelectedCount();
 }
 
@@ -381,7 +404,7 @@ async function startRun() {
     });
     state.currentRunId = run.id;
     renderRun(run);
-    pollRun();
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
     showToast("已加入队列");
   } catch (error) {
     showToast(error.message);
@@ -491,7 +514,7 @@ async function runJob(jobId) {
     const run = await api(`/api/jobs/${jobId}/run`, { method: "POST" });
     state.currentRunId = run.id;
     renderRun(run);
-    pollRun();
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
     showToast("任务已启动");
   } catch (error) {
     showToast(error.message);
@@ -536,23 +559,67 @@ function renderRunHistory(runs) {
 
 async function openRun(runId) {
   try {
+    clearRunStream();
     state.currentRunId = runId;
     const run = await api(`/api/runs/${runId}?logs_limit=120`);
     renderRun(run);
-    if (ACTIVE_RUN_STATUSES.has(run.status)) pollRun();
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
   } catch (error) {
     showToast(error.message);
   }
 }
 
-async function pollRun() {
+function subscribeRun(runId) {
+  clearRunStream();
+  if (!window.EventSource) {
+    pollRun();
+    return;
+  }
+  state.runEvents = new EventSource(`/api/runs/${runId}/events?logs_limit=80`);
+  let lastEventAt = Date.now();
+  const handleRunEvent = (event) => {
+    lastEventAt = Date.now();
+    const run = JSON.parse(event.data);
+    renderRun(run);
+    if (!RUN_STREAM_STATUSES.has(run.status)) {
+      clearRunStream();
+      loadRuns();
+    }
+  };
+  state.runEvents.addEventListener("run", handleRunEvent);
+  state.runEvents.onmessage = handleRunEvent;
+  state.runEvents.onerror = () => {
+    clearRunStream();
+    pollRun();
+  };
+  state.catchupTimer = window.setInterval(() => {
+    if (!state.currentRunId || Date.now() - lastEventAt < 5000) return;
+    pollRun(false);
+    lastEventAt = Date.now();
+  }, 5000);
+}
+
+function clearRunStream() {
+  window.clearTimeout(state.pollTimer);
+  window.clearInterval(state.catchupTimer);
+  state.pollTimer = null;
+  state.catchupTimer = null;
+  if (state.runEvents) {
+    state.runEvents.close();
+    state.runEvents = null;
+  }
+}
+
+async function pollRun(continuePolling = true) {
   window.clearTimeout(state.pollTimer);
   if (!state.currentRunId) return;
   try {
     const run = await api(`/api/runs/${state.currentRunId}?logs_limit=80`);
     renderRun(run);
-    if (ACTIVE_RUN_STATUSES.has(run.status)) {
-      state.pollTimer = window.setTimeout(pollRun, run.status === "pause_requested" ? 700 : 1400);
+    if (RUN_STREAM_STATUSES.has(run.status)) {
+      if (continuePolling) {
+        state.pollTimer = window.setTimeout(pollRun, run.status === "pause_requested" ? 700 : 1400);
+      }
     } else {
       await loadRuns();
     }
@@ -566,10 +633,14 @@ function renderRun(run) {
   els.runStatus.textContent = `${runStatusLabel(run.status)} | ${formatNumber(run.processed_rows)}/${formatNumber(run.total_rows)} | ${percent}%`;
   renderRunMetrics(run);
   els.progressBar.style.width = `${Math.min(100, percent)}%`;
-  els.pauseBtn.classList.toggle("hidden", !ACTIVE_RUN_STATUSES.has(run.status));
-  els.pauseBtn.disabled = run.status === "pause_requested";
+  els.pauseBtn.classList.toggle("hidden", !RUN_PAUSABLE_STATUSES.has(run.status));
+  els.pauseBtn.disabled = run.status === "pause_requested" || run.status === "cancel_requested";
   els.pauseBtn.textContent = run.status === "pause_requested" ? "暂停中" : "暂停";
   els.pauseBtn.onclick = () => pauseRun(run.id);
+  els.cancelBtn.classList.toggle("hidden", !RUN_CANCELABLE_STATUSES.has(run.status));
+  els.cancelBtn.disabled = run.status === "cancel_requested";
+  els.cancelBtn.textContent = run.status === "cancel_requested" ? "取消中" : "取消";
+  els.cancelBtn.onclick = () => cancelRun(run.id);
   els.resumeBtn.classList.toggle("hidden", !RESUMABLE_RUN_STATUSES.has(run.status));
   els.resumeBtn.onclick = () => resumeRun(run.id);
 
@@ -611,7 +682,7 @@ async function resumeRun(runId) {
   try {
     const run = await api(`/api/runs/${runId}/resume`, { method: "POST" });
     renderRun(run);
-    pollRun();
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
     showToast("已继续");
   } catch (error) {
     showToast(error.message);
@@ -622,8 +693,20 @@ async function pauseRun(runId) {
   try {
     const run = await api(`/api/runs/${runId}/pause`, { method: "POST" });
     renderRun(run);
-    pollRun();
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
     showToast("已请求暂停，当前批次完成后会停住");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function cancelRun(runId) {
+  if (!window.confirm("取消后不能继续这个运行记录，确定取消吗？")) return;
+  try {
+    const run = await api(`/api/runs/${runId}/cancel`, { method: "POST" });
+    renderRun(run);
+    if (RUN_STREAM_STATUSES.has(run.status)) subscribeRun(run.id);
+    showToast(run.status === "canceled" ? "已取消" : "已请求取消，当前批次完成后会停住");
   } catch (error) {
     showToast(error.message);
   }
@@ -638,6 +721,7 @@ function setBusy(isBusy) {
   els.startBtn.disabled = isBusy;
   els.saveJobBtn.disabled = isBusy;
   els.pauseBtn.disabled = isBusy;
+  els.cancelBtn.disabled = isBusy;
 }
 
 function escapeHtml(value) {
@@ -656,7 +740,19 @@ function bindEvents() {
   els.testTestBtn.addEventListener("click", () => testConnection("test"));
   els.refreshAllBtn.addEventListener("click", refreshAll);
   els.reloadTablesBtn.addEventListener("click", loadTables);
-  els.tableSearch.addEventListener("input", renderTables);
+  els.tableSearch.addEventListener("input", () => {
+    state.tableScrollTop = 0;
+    els.tableList.scrollTop = 0;
+    renderTables();
+  });
+  els.tableList.addEventListener("scroll", () => {
+    state.tableScrollTop = els.tableList.scrollTop;
+    if (state.tableFrame) return;
+    state.tableFrame = window.requestAnimationFrame(() => {
+      state.tableFrame = null;
+      renderTables();
+    });
+  });
   els.selectVisibleBtn.addEventListener("click", () => {
     for (const table of filteredTables()) state.selected.add(table.name);
     renderTables();

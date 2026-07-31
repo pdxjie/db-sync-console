@@ -79,6 +79,17 @@ button:disabled {
   border-color: var(--border-strong);
 }
 
+.danger {
+  border-color: #f3b2ad;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.danger:hover {
+  border-color: var(--danger);
+  background: #ffe4e0;
+}
+
 h1,
 h2,
 p {
@@ -285,6 +296,7 @@ legend {
 }
 
 .table-list {
+  position: relative;
   flex: 1;
   min-height: 320px;
   margin-top: 10px;
@@ -292,6 +304,18 @@ legend {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fff;
+}
+
+.table-virtual-spacer {
+  position: relative;
+  min-height: 100%;
+}
+
+.table-virtual-window {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
 }
 
 .table-item {
@@ -316,6 +340,16 @@ legend {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.feature-hint {
+  margin: 0 14px 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .row-count {
