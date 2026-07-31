@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sync_tool.config import AppConfig, Config, MySQLConfig, SafetyConfig
 from sync_tool.store import SyncStore
@@ -217,6 +218,173 @@ class SyncPauseTests(unittest.TestCase):
 
             self.assertEqual(table["status"], "canceled")
             self.assertEqual(table["processed_rows"], 7)
+
+    def test_cancel_request_turns_active_database_error_into_canceled_run(self):
+        class CancelAfterDatabaseErrorEngine(SyncEngine):
+            def _execute_offset_table(self, run, table_state, *, resume=False):
+                self.store.update_run(run["id"], fetch=False, status="cancel_requested")
+                raise RuntimeError("(2013, 'Lost connection to MySQL server during query (timed out)')")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            engine = CancelAfterDatabaseErrorEngine(engine.config, store)
+            create_run(store, status="queued")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 5,
+                    "offset_value": 5,
+                    "status": "running",
+                }
+            )
+
+            engine.execute_run("run-1")
+
+            run = store.get_run("run-1")
+            table = store.get_run_table("run-1", "orders")
+            self.assertEqual(run["status"], "canceled")
+            self.assertEqual(table["status"], "canceled")
+            self.assertIsNone(run["error"])
+
+    def test_cancel_request_turns_shard_database_error_into_canceled_shard(self):
+        class DummyConnection:
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="running")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 0,
+                    "cursor_field": "id",
+                    "status": "running",
+                }
+            )
+            shard = store.create_run_shard(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "shard_index": 0,
+                    "processed_rows": 0,
+                    "status": "running",
+                }
+            )
+            run = {**store.get_run("run-1"), "where_clause": "", "batch_size": 100, "mode": "replace"}
+
+            def fail_after_cancel(*args, **kwargs):
+                store.update_run("run-1", fetch=False, status="cancel_requested")
+                raise RuntimeError("(2013, 'Lost connection to MySQL server during query (timed out)')")
+
+            with patch("sync_tool.sync.mysql.connect", return_value=DummyConnection()):
+                with patch("sync_tool.sync.mysql.fetch_keyset_batch", side_effect=fail_after_cancel):
+                    with self.assertRaises(SyncCancelled):
+                        engine._execute_cursor_shard(run, "orders", shard, ["id"], ["id"], ["id"])
+
+            shard = store.get_run_shards("run-1", "orders")[0]
+            self.assertEqual(shard["status"], "canceled")
+            self.assertIsNone(shard["error"])
+
+    def test_keyset_shard_stops_without_extra_empty_fetch_after_short_batch(self):
+        class DummyConnection:
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="running")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 0,
+                    "cursor_field": "id",
+                    "status": "running",
+                }
+            )
+            shard = store.create_run_shard(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "shard_index": 0,
+                    "processed_rows": 0,
+                    "status": "running",
+                }
+            )
+            run = {**store.get_run("run-1"), "where_clause": "", "batch_size": 2, "mode": "replace"}
+
+            with patch("sync_tool.sync.mysql.connect", return_value=DummyConnection()):
+                with patch("sync_tool.sync.mysql.fetch_keyset_batch", return_value=[{"id": 10}]) as fetch:
+                    with patch("sync_tool.sync.mysql.insert_rows"):
+                        engine._execute_cursor_shard(run, "orders", shard, ["id"], ["id"], ["id"])
+
+            shard = store.get_run_shards("run-1", "orders")[0]
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(shard["status"], "success")
+            self.assertEqual(shard["processed_rows"], 1)
+            self.assertEqual(shard["last_pk"], "10")
+
+    def test_offset_table_stops_without_extra_empty_fetch_after_short_batch(self):
+        class DummyConnection:
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, store = make_engine(tmp)
+            create_run(store, status="running")
+            store.create_run_table(
+                {
+                    "run_id": "run-1",
+                    "table_name": "orders",
+                    "total_rows": 10,
+                    "processed_rows": 0,
+                    "offset_value": 0,
+                    "status": "running",
+                }
+            )
+            run = {**store.get_run("run-1"), "where_clause": "", "batch_size": 2, "mode": "replace", "skip_exact_count": True}
+            table_state = store.get_run_table("run-1", "orders")
+            column_plan = {
+                "fetch_columns": ["id"],
+                "write_columns": ["id"],
+                "source_primary_keys": ["id"],
+                "target_primary_keys": ["id"],
+                "write_primary_keys": ["id"],
+            }
+
+            with patch("sync_tool.sync.mysql.connect", return_value=DummyConnection()):
+                with patch.object(engine, "_ensure_destination_table", return_value=True):
+                    with patch.object(engine, "_resolve_table_columns", return_value=column_plan):
+                        with patch("sync_tool.sync.mysql.fetch_batch", return_value=[{"id": 10}]) as fetch:
+                            with patch("sync_tool.sync.mysql.insert_rows"):
+                                engine._execute_offset_table(run, table_state)
+
+            table = store.get_run_table("run-1", "orders")
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(table["status"], "success")
+            self.assertEqual(table["processed_rows"], 1)
+            self.assertEqual(table["offset_value"], 1)
 
 
 if __name__ == "__main__":

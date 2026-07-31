@@ -109,7 +109,7 @@ engine = SyncEngine(lambda: effective_config(), store, event_callback=event_brok
 manager = SyncManager(engine)
 scheduler = JobScheduler(base_config, store, manager)
 
-app = FastAPI(title="同步犬", version="0.1.0")
+app = FastAPI(title="同步犬", version="0.1.7")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

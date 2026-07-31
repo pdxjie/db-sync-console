@@ -455,6 +455,14 @@ class SyncEngine:
         except SyncCancelled:
             self._finalize_canceled_run(run_id, current_table)
         except Exception as exc:
+            try:
+                self._raise_if_stop_requested(run_id, current_table)
+            except SyncPaused:
+                self._finalize_paused_run(run_id, current_table)
+                return
+            except SyncCancelled:
+                self._finalize_canceled_run(run_id, current_table)
+                return
             message = str(exc)
             if current_table:
                 self.store.update_run_table(run_id, current_table, status="failed", error=message)
@@ -476,6 +484,7 @@ class SyncEngine:
             processed = int(table_state["processed_rows"]) if resume else 0
             processed_bytes = int(table_state.get("processed_bytes") or 0) if resume else 0
             total_rows = int(table_state["total_rows"])
+            batch_size = int(run["batch_size"])
 
             target_created = self._ensure_destination_table(prod_conn, test_conn, run, table)
             column_info = self._resolve_table_columns(prod_conn, test_conn, run, table)
@@ -497,7 +506,7 @@ class SyncEngine:
                     fetch_columns,
                     run["where_clause"],
                     order_columns,
-                    int(run["batch_size"]),
+                    batch_size,
                     offset,
                     extra_conditions,
                 )
@@ -527,6 +536,8 @@ class SyncEngine:
                 )
                 self._refresh_run_progress(run_id)
                 self.log(run_id, "info", f"{table}: {processed}/{total_rows} rows synced.")
+                if len(rows) < batch_size:
+                    break
 
             final_total_rows = max(total_rows, processed) if count_is_estimated else total_rows
             self.store.update_run_table(
@@ -541,8 +552,12 @@ class SyncEngine:
             )
             self._refresh_run_progress(run_id)
             self.log(run_id, "info", f"{table}: completed.")
-        except Exception:
+        except Exception as exc:
             test_conn.rollback()
+            try:
+                self._raise_if_stop_requested(run_id, table)
+            except (SyncPaused, SyncCancelled) as control:
+                raise control from exc
             raise
         finally:
             prod_conn.close()
@@ -659,6 +674,7 @@ class SyncEngine:
         last_values = self._decode_cursor_values(last_pk, len(cursor_fields))
         extra_conditions = self._extra_conditions(run.get("incremental_field", ""), run.get("incremental_since", ""))
         last_aggregate_at = monotonic()
+        batch_size = int(run["batch_size"])
         try:
             self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="running", error=None)
             self.log(
@@ -674,7 +690,7 @@ class SyncEngine:
                     fetch_columns,
                     run["where_clause"],
                     cursor_fields,
-                    int(run["batch_size"]),
+                    batch_size,
                     last_values=last_values,
                     shard_start=shard.get("start_pk"),
                     shard_end=shard.get("end_pk"),
@@ -711,6 +727,8 @@ class SyncEngine:
                     self.store.aggregate_shards(run_id, table)
                     self._refresh_run_progress(run_id)
                     last_aggregate_at = now
+                if len(rows) < batch_size:
+                    break
 
             self.store.update_run_shard(
                 run_id,
@@ -729,6 +747,10 @@ class SyncEngine:
             raise
         except Exception as exc:
             test_conn.rollback()
+            try:
+                self._raise_if_stop_requested(run_id, table, shard_index)
+            except (SyncPaused, SyncCancelled) as control:
+                raise control from exc
             self.store.update_run_shard(run_id, table, shard_index, fetch=False, status="failed", error=str(exc))
             raise
         finally:
@@ -1368,7 +1390,7 @@ class SyncManager:
             self.engine.log(
                 run_id,
                 "warning",
-                "Cancel requested. Sync will stop after the current batch is committed.",
+                "Cancel requested. The active MySQL query is not killed directly; sync will stop at the next batch checkpoint.",
             )
         return self.get_run(run_id)
 
